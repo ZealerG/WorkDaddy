@@ -155,9 +155,13 @@ $logoIco = Join-Path $AppDir 'WorkDaddy.ico'
 try {
   $ws = New-Object -ComObject WScript.Shell
   $sc = $ws.CreateShortcut($lnkPath)
+  $launcherSilent = Join-Path $targetScripts 'launcher-silent.cmd'
   if (Test-Path $launcherVbs) {
     $sc.TargetPath       = Join-Path $env:WINDIR 'System32\wscript.exe'
     $sc.Arguments        = '//nologo "' + $launcherVbs + '"'
+  } elseif (Test-Path $launcherSilent) {
+    $sc.TargetPath       = $launcherSilent
+    $sc.Arguments        = ''
   } else {
     $sc.TargetPath       = "$env:ComSpec"
     $sc.Arguments        = '/d /c call "' + $launcher + '"'

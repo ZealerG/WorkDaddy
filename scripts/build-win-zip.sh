@@ -60,7 +60,7 @@ if [ -d "$BUILTIN_SRC" ]; then
   mkdir -p scripts/builtin
   cp -R "$BUILTIN_SRC/." scripts/builtin/
 else
-  echo "==> 警告: 未找到内置资产 $BUILTIN_SRC（无 WorkDaddy.app？），打包将不含官方壁纸/主题"
+  echo "==> 警告: 未找到内置资产 ${BUILTIN_SRC}（无 WorkDaddy.app？），打包将不含官方壁纸/主题"
 fi
 
 # 3) 打包：staging 目录，把两个顶层入口文件 + scripts/ 一起打进 zip 根（解压即见一键安装/启动）
