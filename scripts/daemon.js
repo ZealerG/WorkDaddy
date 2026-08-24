@@ -276,7 +276,18 @@ async function selectCdpPort(logFn = log) {
  * 面板红点提示 → 用户点更新 → daemon 下载 dmg + SHA-256 校验 → 挂载拷贝出新 app →
  * 写 apply-update.sh 由独立脚本接管替换（运行中的 app 无法自删，必须由外部脚本完成）→ relaunch。
  */
-const UPDATE_REPO = process.env.WBSWITCH_UPDATE_REPO || 'babygoton/WorkDaddy';
+// 更新来源优先级：环境变量 WBSWITCH_UPDATE_REPO > 数据目录 update-repo.json > 默认上游
+// 数据目录文件可在不修改代码/环境变量的前提下把已安装实例指向 fork 仓库，且能跨更新保留。
+const UPDATE_REPO_FILE = path.join(DATA_DIR, 'update-repo.json');
+function resolveUpdateRepo() {
+  if (process.env.WBSWITCH_UPDATE_REPO) return process.env.WBSWITCH_UPDATE_REPO;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(UPDATE_REPO_FILE, 'utf8'));
+    if (cfg && typeof cfg.repo === 'string' && cfg.repo.trim()) return cfg.repo.trim();
+  } catch (_) { /* 文件不存在或格式错误，回退默认 */ }
+  return 'babygoton/WorkDaddy';
+}
+const UPDATE_REPO = resolveUpdateRepo();
 const UPDATE_API = `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`;
 const UPDATE_CHECK_INTERVAL = 6 * 3600 * 1000; // 每 6 小时检查一次（GitHub 未认证限流 60 次/h）
 const UPDATE_REQ_TIMEOUT = 10000; // 网络超时，超时静默失败不阻塞面板
