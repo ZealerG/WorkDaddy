@@ -1,8 +1,26 @@
 #!/usr/bin/env bash
-# WorkDaddy Windows 发布包打包脚本（在 macOS/Linux 上运行即可产出 Windows zip）
-# 产出：release/windows/WorkDaddy-<profile>-<ver>-win64.zip（只发布 WorkDaddy / WorkDaddy AI）
+# WorkDaddy Windows 安装暂存脚本（在 macOS/Linux/Windows Git Bash 上运行）
+# 产出的是供 build-win-installer.ps1 消费的临时 ZIP；Windows 正式发行只交付 Setup.exe，
+# 安装器完成后会删除该暂存 ZIP，旧 ZIP 仅由更新器兼容读取历史版本。
 # 可选：内置 node_modules/ws（面板 DevTools 代理依赖；无则代理功能降级，其余功能不受影响）
 set -euo pipefail
+
+# Git Bash on a clean Windows machine may expose a Microsoft Store python3
+# stub that exits without running Python.  Accept an explicit interpreter and
+# otherwise select the first candidate that can execute a tiny import check.
+PYTHON_BIN="${WORKDADDY_PYTHON:-}"
+if [ -z "$PYTHON_BIN" ]; then
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys' >/dev/null 2>&1; then
+      PYTHON_BIN="$candidate"
+      break
+    fi
+  done
+fi
+if [ -z "$PYTHON_BIN" ]; then
+  echo "错误：缺少可用 Python（可设置 WORKDADDY_PYTHON 指向 python.exe）" >&2
+  exit 2
+fi
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
@@ -32,14 +50,50 @@ case "$PROFILE" in
   *) PROFILE="workbuddy-cn"; PACKAGE_NAME="WorkDaddy"; OUT="release/windows/WorkDaddy-${VERSION}-win64.zip" ;;
 esac
 
-if [ ! -f scripts/apply-update.vbs ]; then
-  echo "错误：关键文件 scripts/apply-update.vbs 缺失，无法生成 Windows 更新包" >&2
-  exit 2
-fi
-
 echo "==> profile: ${PROFILE}"
 echo "==> 版本: ${VERSION}"
 echo "==> 产物: ${OUT}"
+
+# 发行包必须自带固定 Node 运行时；不能把 WorkBuddy 的私有运行时目录当成用户环境依赖。
+# 版本、下载地址和校验值与 Dream Skin 的 Windows 打包策略一致，允许通过
+# WORKDADDY_NODE_ARCHIVE 指向预下载压缩包以支持离线/受限网络构建。
+NODE_VERSION="${WORKDADDY_NODE_VERSION:-22.23.1}"
+NODE_ARCHIVE="node-v${NODE_VERSION}-win-x64.zip"
+NODE_URL="${WORKDADDY_NODE_URL:-https://npmmirror.com/mirrors/node/v${NODE_VERSION}/${NODE_ARCHIVE}}"
+NODE_SHA256="7df0bc9375723f4a86b3aa1b7cc73342423d9677a8df4538aca31a049e309c29"
+NODE_CACHE="${WORKDADDY_NODE_CACHE:-$DIR/release/.cache}"
+mkdir -p "$NODE_CACHE"
+
+# 正式 Windows 入口是自包含原生 EXE。它负责标准权限、单实例、原生对话框和
+# 精确进程检测；普通启动不再经过 cmd/vbs/PowerShell/CIM。
+GO_BIN="${WORKDADDY_GO:-go}"
+if ! command -v "$GO_BIN" >/dev/null 2>&1 && [ ! -x "$GO_BIN" ]; then
+  echo "错误：缺少 Go 1.24+（可设置 WORKDADDY_GO 指向 go.exe）" >&2
+  exit 2
+fi
+NATIVE_LAUNCHER="$NODE_CACHE/WorkDaddyLauncher.exe"
+echo "==> 编译原生 Windows 启动器"
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 "$GO_BIN" build -trimpath \
+  -ldflags '-s -w -H=windowsgui' -o "$NATIVE_LAUNCHER" ./scripts/windows-native/main.go
+test -s "$NATIVE_LAUNCHER"
+NODE_ARCHIVE_PATH="${WORKDADDY_NODE_ARCHIVE:-$NODE_CACHE/$NODE_ARCHIVE}"
+if [ ! -f "$NODE_ARCHIVE_PATH" ]; then
+  echo "==> 下载 Node.js v${NODE_VERSION} Windows x64 运行时"
+  curl --fail --location --retry 3 --retry-delay 2 --silent --show-error "$NODE_URL" -o "$NODE_ARCHIVE_PATH"
+fi
+if command -v shasum >/dev/null 2>&1; then
+  NODE_ACTUAL_SHA256="$(shasum -a 256 "$NODE_ARCHIVE_PATH" | awk '{print $1}')"
+elif command -v sha256sum >/dev/null 2>&1; then
+  NODE_ACTUAL_SHA256="$(sha256sum "$NODE_ARCHIVE_PATH" | awk '{print $1}')"
+else
+  echo "错误：缺少 shasum/sha256sum，无法验证 Node.js 运行时" >&2
+  exit 2
+fi
+if [ "$NODE_ACTUAL_SHA256" != "$NODE_SHA256" ]; then
+  echo "错误：Node.js 运行时 SHA-256 不匹配，期望 ${NODE_SHA256}，实际 ${NODE_ACTUAL_SHA256}" >&2
+  exit 2
+fi
+echo "==> Node.js 运行时校验通过: ${NODE_ARCHIVE}"
 
 # 1) 内置 ws（面板 DevTools 代理需要）；已存在则跳过
 if [ ! -d scripts/node_modules/ws ]; then
@@ -52,16 +106,31 @@ if [ ! -d scripts/node_modules/ws ]; then
   rm -rf "$TMPNODE"
 fi
 
-# 2) 内置资产（官方壁纸 + nebula 主题，单一来源：WorkDaddy.app/Contents/Resources/scripts/builtin）
-#    仓库 scripts/ 本身不含 builtin，必须从 app 打包产物复制，否则 Windows 面板会显示「暂无官方壁纸」
-BUILTIN_SRC="$DIR/WorkDaddy.app/Contents/Resources/scripts/builtin"
-if [ -d "$BUILTIN_SRC" ]; then
-  echo "==> 内置资产 builtin -> scripts/builtin（$(find "$BUILTIN_SRC/wallpapers" -name '*.webp' | wc -l | tr -d ' ') 张壁纸 + 主题）"
-  mkdir -p scripts/builtin
-  cp -R "$BUILTIN_SRC/." scripts/builtin/
-else
-  echo "==> 警告: 未找到内置资产 ${BUILTIN_SRC}（无 WorkDaddy.app？），打包将不含官方壁纸/主题"
+# 2) 内置资产（官方壁纸 + nebula 主题）。Windows 安装包必须自带这些文件，
+#    否则首次启动无法初始化 themes/wallpapers，面板会永久显示「暂无官方壁纸」。
+#    优先使用 staging/源码目录，其次使用仓库内的 macOS app 壳；显式工作目录
+#    兼容从外部 app 产物构建。缺失或为空时硬失败，禁止生成坏包。
+has_builtin_assets() {
+  [ -f "$1/nebula/theme.json" ] && [ -d "$1/wallpapers" ]
+}
+BUILTIN_SRC="$DIR/scripts/builtin"
+if ! has_builtin_assets "$BUILTIN_SRC"; then
+  BUILTIN_SRC="$DIR/WorkDaddy.app/Contents/Resources/scripts/builtin"
 fi
+if ! has_builtin_assets "$BUILTIN_SRC" && [ -n "${WBSWITCH_DIR:-}" ]; then
+  BUILTIN_SRC="$WBSWITCH_DIR/WorkDaddy.app/Contents/Resources/scripts/builtin"
+fi
+if ! has_builtin_assets "$BUILTIN_SRC"; then
+  echo "错误：未找到内置资产（需要 builtin/nebula/theme.json 和 builtin/wallpapers）" >&2
+  exit 2
+fi
+WALLPAPER_COUNT="$(find "$BUILTIN_SRC/wallpapers" -type f -name '*.webp' | wc -l | tr -d '[:space:]')"
+if [ "${WALLPAPER_COUNT:-0}" -le 0 ]; then
+  echo "错误：内置官方壁纸为空：$BUILTIN_SRC/wallpapers" >&2
+  exit 2
+fi
+echo "==> 内置资产来源: ${BUILTIN_SRC}（${WALLPAPER_COUNT} 张壁纸 + 主题）"
+WALLPAPER_OVERRIDE="$DIR/scripts/builtin-overrides/wallpaper-06.webp"
 
 # 3) 打包：staging 目录，把两个顶层入口文件 + scripts/ 一起打进 zip 根（解压即见一键安装/启动）
 #    注意 apply-update.ps1 复用本结构（需 zip 内存在 scripts\daemon.js 做 srcRoot 判定）
@@ -70,22 +139,84 @@ STAGE="$(mktemp -d)"
 if [ -f "$OUT" ]; then
   rm -f "$OUT" || true
 fi
-# 3.1) 顶层入口（zip 根）：Install-WorkDaddy.cmd / Start-WorkDaddy.cmd
+# 3.1) 顶层入口（zip 根）：Install-WorkDaddy.cmd / Start-WorkDaddy.cmd / Uninstall-WorkDaddy.cmd
 cp scripts/Install-WorkDaddy.cmd "$STAGE/Install-WorkDaddy.cmd"
 cp scripts/Start-WorkDaddy.cmd "$STAGE/Start-WorkDaddy.cmd"
-# 3.1a) Windows 故障排查提示词（供用户在安装失败时交给修复 agent）
-if [ -f "$DIR/安装失败自主解决提示词.txt" ]; then
-  cp "$DIR/安装失败自主解决提示词.txt" "$STAGE/安装失败自主解决提示词.txt"
-fi
+cp scripts/Uninstall-WorkDaddy.cmd "$STAGE/Uninstall-WorkDaddy.cmd"
 # 3.2) scripts\ 本体（含 node_modules/ws、builtin）
 cp -R scripts "$STAGE/scripts"
+# 内置资产直接写入 staging，避免修改源码树，也确保最终 ZIP/Setup.exe 一定包含它们。
+rm -rf "$STAGE/scripts/builtin"
+mkdir -p "$STAGE/scripts/builtin"
+cp -R "$BUILTIN_SRC/." "$STAGE/scripts/builtin/"
+# The asset fallback may be an older app shell; always use current task presets.
+mkdir -p "$STAGE/scripts/builtin/automations"
+cp scripts/builtin/automations/*.json "$STAGE/scripts/builtin/automations/"
+if [ -f "$WALLPAPER_OVERRIDE" ]; then
+  mkdir -p "$STAGE/scripts/builtin/wallpapers" "$STAGE/scripts/builtin/nebula"
+  cp "$WALLPAPER_OVERRIDE" "$STAGE/scripts/builtin/wallpapers/wallpaper-06.webp"
+  cp "$WALLPAPER_OVERRIDE" "$STAGE/scripts/builtin/nebula/background.webp"
+fi
+STAGED_WALLPAPER_COUNT="$(find "$STAGE/scripts/builtin/wallpapers" -type f -name '*.webp' | wc -l | tr -d '[:space:]')"
+if [ "${STAGED_WALLPAPER_COUNT:-0}" -le 0 ] || [ ! -s "$STAGE/scripts/builtin/nebula/theme.json" ]; then
+  echo "错误：staging 内置资产不完整（wallpapers=${STAGED_WALLPAPER_COUNT:-0}，缺少 nebula/theme.json）" >&2
+  exit 2
+fi
+cp "$NATIVE_LAUNCHER" "$STAGE/WorkDaddyLauncher.exe"
+printf '%s\n' "$PROFILE" > "$STAGE/scripts/profile-id.txt"
+echo "==> 原生入口: WorkDaddyLauncher.exe (${PROFILE})"
+# Windows cmd.exe expects CRLF in batch files.  Normalise every staged .cmd
+# after copying so a source edit made on macOS cannot leave a mixed-ending
+# launcher that silently stops before invoking Node.
+"$PYTHON_BIN" - "$(winpath "$STAGE")" <<'PY'
+import os
+import sys
+
+stage = sys.argv[1]
+for root, _, files in os.walk(stage):
+    for name in files:
+        if not name.lower().endswith('.cmd'):
+            continue
+        path = os.path.join(root, name)
+        with open(path, 'rb') as f:
+            text = f.read().decode('utf-8-sig')
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        with open(path, 'w', encoding='utf-8', newline='') as f:
+            f.write(text.replace('\n', '\r\n'))
+PY
+# 3.2b) 只提取 Node 可执行文件和许可证，避免把完整开发压缩包放进用户包。
+"$PYTHON_BIN" - "$(winpath "$NODE_ARCHIVE_PATH")" "$(winpath "$STAGE/scripts/runtime/node")" <<'PY'
+import os
+import sys
+import zipfile
+
+archive_path, destination = sys.argv[1:]
+with zipfile.ZipFile(archive_path) as archive:
+    names = archive.namelist()
+    root = next((name.split('/')[0] for name in names if name.endswith('/node.exe')), None)
+    if not root:
+        raise SystemExit('Node.js archive missing node.exe')
+    os.makedirs(destination, exist_ok=True)
+    for entry_name, output_name in ((f'{root}/node.exe', 'node.exe'), (f'{root}/LICENSE', 'LICENSE')):
+        try:
+            info = archive.getinfo(entry_name)
+        except KeyError:
+            raise SystemExit(f'Node.js archive missing {entry_name}')
+        if info.file_size <= 0:
+            raise SystemExit(f'Node.js archive entry is empty: {entry_name}')
+        with archive.open(info) as source, open(os.path.join(destination, output_name), 'wb') as target:
+            target.write(source.read())
+PY
+test -s "$STAGE/scripts/runtime/node/node.exe"
+test -s "$STAGE/scripts/runtime/node/LICENSE"
+echo "==> 内置 Node.js: scripts/runtime/node/node.exe"
 # 3.2a) 打包期 profile 替换（统一用 python3，mac/win 均可用）：
 #       1) win-launcher.js 默认 profile
 #       2) 三个 ps1 仅替换 param 默认值处的占位符（[string]$Profile = '...'），
 #          绝不能全局替换 __WBS_DEFAULT_PROFILE__ —— 否则判断条件
 #          $Profile -eq '__WBS_DEFAULT_PROFILE__' 会被替换成 $Profile -eq 'workbuddy-ai'，
 #          让 AI 包默认 profile 自身触发"回退到 workbuddy-cn"，桌面快捷方式名/安装目录全部错乱。
-PROFILE="$PROFILE" BUILD_VERSION="$VERSION" python3 - "$(winpath "$STAGE/scripts")" <<'PY'
+PROFILE="$PROFILE" BUILD_VERSION="$VERSION" "$PYTHON_BIN" - "$(winpath "$STAGE/scripts")" <<'PY'
 import os
 import re
 import sys
@@ -163,10 +294,10 @@ else
   echo "==> 警告: 未找到 release/WorkDaddy.ico，桌面图标将回退为 cmd 默认"
 fi
 # 3.3) 排除开发/临时文件 + 顶层入口在 scripts\ 内的重复副本
-#      （Install-WorkDaddy.cmd / Start-WorkDaddy.cmd 只应存在于 zip 根，避免用户误进
-#       scripts\ 双击导致相对路径解析成 scripts\scripts\install-win.ps1 报错）
+#      （Install-WorkDaddy.cmd / Start-WorkDaddy.cmd / Uninstall-WorkDaddy.cmd 只应存在
+#       于 zip 根，避免用户误进 scripts\ 双击导致相对路径解析错误）
 rm -rf "$STAGE/scripts/win/probe" "$STAGE/scripts/win/probe/"* 2>/dev/null || true
-rm -f "$STAGE/scripts/Install-WorkDaddy.cmd" "$STAGE/scripts/Start-WorkDaddy.cmd" 2>/dev/null || true
+rm -f "$STAGE/scripts/Install-WorkDaddy.cmd" "$STAGE/scripts/Start-WorkDaddy.cmd" "$STAGE/scripts/Uninstall-WorkDaddy.cmd" 2>/dev/null || true
 find "$STAGE" -name '*.log' -delete 2>/dev/null || true
 find "$STAGE" -name '.DS_Store' -delete 2>/dev/null || true
 # 3.3a) AI 包品牌化：cmd 描述/桌面图标/安装目录名跟随工包显示为 WorkDaddy AI
@@ -174,7 +305,7 @@ find "$STAGE" -name '.DS_Store' -delete 2>/dev/null || true
 #        数据目录 %APPDATA%\WorkDaddy、WorkDaddy.ico 不随包变，保持原样。）
 if [ "$PROFILE" = "workbuddy-ai" ]; then
   echo "==> AI 包品牌化：cmd 描述 / 桌面图标 / 安装目录名 → WorkDaddy AI"
-  python3 - "$(winpath "$STAGE")" <<'PY'
+"$PYTHON_BIN" - "$(winpath "$STAGE")" <<'PY'
 import os
 import sys
 
@@ -184,13 +315,16 @@ def patch(path, pairs):
     p = os.path.join(stage, path)
     if not os.path.exists(p):
         return
-    with open(p, 'r', encoding='utf-8') as f:
-        s = f.read()
+    with open(p, 'rb') as f:
+        raw = f.read()
+    has_bom = raw.startswith(b'\xef\xbb\xbf')
+    s = raw.decode('utf-8-sig')
     for old, new in pairs:
         if old in s:
             s = s.replace(old, new)
-    with open(p, 'w', encoding='utf-8', newline='') as f:
-        f.write(s)
+    encoded = s.encode('utf-8')
+    with open(p, 'wb') as f:
+        f.write((b'\xef\xbb\xbf' if has_bom else b'') + encoded)
 
 # zip 根两个入口 cmd
 patch('Install-WorkDaddy.cmd', [
@@ -202,6 +336,14 @@ patch('Start-WorkDaddy.cmd', [
     ('WorkDaddy 一键启动', 'WorkDaddy AI 一键启动'),
     ('「WorkDaddy」图标', '「WorkDaddy AI」图标'),
     ('WorkDaddy launcher starting', 'WorkDaddy AI launcher starting'),
+])
+patch('Uninstall-WorkDaddy.cmd', [
+    ('WorkDaddy 一键卸载', 'WorkDaddy AI 一键卸载'),
+    (r'%LOCALAPPDATA%\Programs\WorkDaddy', r'%LOCALAPPDATA%\Programs\WorkDaddy AI'),
+])
+patch('scripts/uninstall-win.cmd', [
+    ('WorkDaddy Windows 卸载核心', 'WorkDaddy AI Windows 卸载核心'),
+    (r'%LOCALAPPDATA%\Programs\WorkDaddy', r'%LOCALAPPDATA%\Programs\WorkDaddy AI'),
 ])
 # scripts\ 内安装/启动/自检脚本（%LOCALAPPDATA%\Programs\WorkDaddy → WorkDaddy AI；数据目录不替换）
 patch('scripts/install-win.cmd', [
@@ -227,22 +369,20 @@ patch('scripts/verify-win.cmd', [
 print('==>  品牌化替换完成（Install/Start/install-win/launcher/verify-win + base64 提示）')
 PY
 fi
-# 3.3.5) 非 ASCII 文件名守护：仅允许根目录的故障排查提示词，其余路径必须保持 ASCII。
+# 3.3.5) 非 ASCII 文件名守护：Windows 安装包路径必须保持 ASCII。
 #        macOS 自带 Info-ZIP 会使用 UTF-8 条目写入；安装/更新脚本本身仍全部使用 ASCII 路径。
 NON_ASCII_PATHS="$(find "$STAGE" -not -path '*/node_modules/*' 2>/dev/null | LC_ALL=C grep '[^ -~]' || true)"
-UNEXPECTED_NON_ASCII="$(printf '%s\n' "$NON_ASCII_PATHS" | LC_ALL=C grep -v '安装失败自主解决提示词\.txt$' || true)"
-if [ -n "$UNEXPECTED_NON_ASCII" ]; then
-  echo "==> ERROR: 发布包包含未批准的非 ASCII 文件路径，已终止打包！"
-  printf '%s\n' "$UNEXPECTED_NON_ASCII" | head -20
+if [ -n "$NON_ASCII_PATHS" ]; then
+  echo "==> ERROR: 发布包包含非 ASCII 文件路径，已终止打包！"
+  printf '%s\n' "$NON_ASCII_PATHS" | head -20
   rm -rf "$STAGE" 2>/dev/null || true
   exit 3
 fi
-echo "==> 非 ASCII 文件名守护通过（仅包含批准的故障排查提示词）"
-# 3.4) 打包：优先使用 Python zipfile，确保中文提示词写入 UTF-8 文件名标记。
-#      macOS 自带 zip 会把中文文件名按本地代码页写入，Windows/Python 解压后会出现乱码。
-#      没有 Python 且需要中文提示词时直接失败，避免生成名字损坏的发布包。
-if command -v python3 >/dev/null 2>&1; then
-  python3 - "$(winpath "$STAGE")" "$(winpath "$DIR/$OUT")" <<'PY'
+echo "==> 非 ASCII 文件名守护通过"
+# 3.4) 打包：优先使用 Python zipfile，确保 Windows 条目编码稳定。
+#      macOS 自带 zip 会把非 ASCII 文件名按本地代码页写入，Windows/Python 解压后会出现乱码。
+if [ -n "$PYTHON_BIN" ]; then
+  "$PYTHON_BIN" - "$(winpath "$STAGE")" "$(winpath "$DIR/$OUT")" <<'PY'
 import os
 import sys
 import zipfile
@@ -261,11 +401,7 @@ with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
             arcname = os.path.relpath(source, stage).replace(os.sep, '/')
             archive.write(source, arcname)
 PY
-elif [ -f "$STAGE/安装失败自主解决提示词.txt" ]; then
-  echo "==> ERROR: 包含中文故障排查提示词，但当前环境没有 python3，无法生成 UTF-8 ZIP。"
-  rm -rf "$STAGE" 2>/dev/null || true
-  exit 4
-elif command -v zip >/dev/null 2>&1; then
+    elif command -v zip >/dev/null 2>&1; then
   (cd "$STAGE" && zip -r -q "$DIR/$OUT" .)
 else
   tar -a -cf "$DIR/$OUT" -C "$STAGE" .
@@ -275,13 +411,5 @@ if [ -d "$STAGE" ]; then
   find "$STAGE" -depth -delete 2>/dev/null || rm -rf "$STAGE" || true
 fi
 
-# 4) 清理临时内置到 scripts/ 的 builtin（避免污染仓库）；rm 可能触发安全删除钩子，失败不中断
-if [ -d "$BUILTIN_SRC" ] && [ -d scripts/builtin ]; then
-  rm -rf scripts/builtin 2>/dev/null || true
-fi
-
-echo "==> 完成: $(ls -lh "$OUT" | awk '{print $5}')"
-echo ""
-echo "在 Windows 上：解压 zip 后，在顶层直接双击 Install-WorkDaddy.cmd 一键安装（自动建桌面图标并清理旧自启）；"
-echo "日常启动双击 Start-WorkDaddy.cmd 或桌面 WorkDaddy 图标。"
-echo "每 6 小时自动检查更新（GitHub Releases 需同时上传 .dmg 与 -win64.zip 两个资产，Windows 自动静默升级）。"
+echo "==> 安装暂存包完成: $(ls -lh "$OUT" | awk '{print $5}')"
+echo "==> 下一步由 build-win-installer.ps1 生成 Setup.exe；正式发行不保留该 ZIP。"

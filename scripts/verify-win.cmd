@@ -5,6 +5,8 @@ rem  作用：验证 Setup.exe / zip 解出的 scripts 是否「完整、可装�
 rem  不修改任何系统状态，纯只读检查，可放心重复运行。
 rem ============================================================
 setlocal
+for /f "tokens=2 delims=:" %%C in ('chcp') do set "ORIGINAL_CODE_PAGE=%%C"
+set "ORIGINAL_CODE_PAGE=%ORIGINAL_CODE_PAGE: =%"
 chcp 65001 >nul
 cd /d "%~dp0"
 set "SCRIPT_DIR=%~dp0"
@@ -18,7 +20,7 @@ set "FAIL=0"
 rem ---- 1) 关键文件齐全 ----
 echo.
 echo [1/6] 检查关键文件...
-for %%F in (daemon.js lib.js watchdog.js win-launcher.js win-inject-helper.js inject.js theme-patches.js launcher.cmd launcher-hidden.vbs install-win.cmd install-win.ps1 win\setup.sed) do (
+for %%F in (daemon.js session-db.js secure-transfer.js lib.js watchdog.js win-launcher.js windows-process-boundary.js windows-process-boundary.ps1 windows-relaunch-standard.ps1 prepare-win-install.ps1 workbuddy-compat.js inject.js theme-patches.js launcher.cmd launcher-hidden.vbs install-win.cmd install-win.ps1 uninstall-win.cmd uninstall-win.ps1 apply-update.ps1 win\setup.sed) do (
   if not exist "%SCRIPT_DIR%%%F" (
     echo   缺失: %%~F
     set /a FAIL+=1
@@ -32,6 +34,11 @@ if exist "%SCRIPT_DIR%..\Install-WorkDaddy.cmd" (
   echo   提示: 顶层 Install-WorkDaddy.cmd 未就位（打包时从 scripts\ 提升到 zip 根）
 )
 if exist "%SCRIPT_DIR%..\Start-WorkDaddy.cmd" echo   顶层入口 Start-WorkDaddy.cmd 存在
+if exist "%SCRIPT_DIR%..\Uninstall-WorkDaddy.cmd" (
+  echo   顶层入口 Uninstall-WorkDaddy.cmd 存在
+) else (
+  echo   提示: 顶层 Uninstall-WorkDaddy.cmd 未就位（打包时从 scripts\ 提升到 zip 根）
+)
 if not exist "%SCRIPT_DIR%node_modules\ws\index.js" (
   echo   警告: node_modules\ws 缺失（DevTools 代理降级，其他功能不受影响）
 )
@@ -55,7 +62,7 @@ if errorlevel 1 (
 rem ---- 3) 脚本语法静态检查（node --check，不执行）----
 echo.
 echo [3/6] 校验 JS 语法...
-for %%F in (daemon.js lib.js watchdog.js win-launcher.js inject.js theme-patches.js) do (
+for %%F in (daemon.js session-db.js secure-transfer.js lib.js watchdog.js win-launcher.js windows-process-boundary.js workbuddy-compat.js inject.js theme-patches.js) do (
   "%NODE%" --check "%SCRIPT_DIR%%%F" >nul 2>&1
   if errorlevel 1 (
     echo   语法错误: %%~F
@@ -67,12 +74,8 @@ echo   JS 语法检查完成
 rem ---- 4) PS1 合法性（PowerShell 解析但不执行）----
 echo.
 echo [4/6] 校验 PS1 脚本语法...
-for %%F in (install-win.ps1) do (
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "$e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile('%SCRIPT_DIR%%%F',[ref]$null,[ref]$e); if($e){Write-Host ('  语法错误: ' + $e.Message); exit 1} else {Write-Host ('  OK: ' + '%%~nF')}; exit 0" >nul 2>&1
-  if errorlevel 1 (
-    echo   语法错误: %%~F
-    set /a FAIL+=1
-  )
+for %%F in (windows-process-boundary.ps1 windows-relaunch-standard.ps1 prepare-win-install.ps1 install-win.ps1 uninstall-win.ps1 apply-update.ps1) do (
+  call :CHECK_PS1 "%SCRIPT_DIR%%%F" "%%~F"
 )
 
 rem ---- 5) 自启清理状态与安装目录回写测试（读态 + 安装目录可写性探测）----
@@ -104,9 +107,21 @@ if exist "%USERPROFILE%\Desktop\WorkDaddy.lnk" (
 echo.
 echo ============================================================
 if "%FAIL%"=="0" (
+  set "VERIFY_EXIT=0"
   echo  自检通过：本包可用于 Windows 安装。
 ) else (
+  set "VERIFY_EXIT=1"
   echo  发现 %FAIL% 处问题，请在下方对照修正后再分发。
 )
 echo ============================================================
-pause
+if not defined CI pause
+if defined ORIGINAL_CODE_PAGE chcp %ORIGINAL_CODE_PAGE% >nul
+exit /b %VERIFY_EXIT%
+
+:CHECK_PS1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$tokens=$null; $errors=$null; [void][System.Management.Automation.Language.Parser]::ParseFile('%~1',[ref]$tokens,[ref]$errors); if($errors.Count -gt 0){exit 1}else{exit 0}" >nul 2>&1
+if errorlevel 1 (
+  echo   语法错误: %~2
+  set /a FAIL+=1
+)
+exit /b 0

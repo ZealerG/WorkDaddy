@@ -3,21 +3,48 @@
 # 默认保留备份数据（%APPDATA%\WorkDaddy）；加 -RemoveData 一并删除。
 param(
   [switch]$RemoveData,
+  [switch]$SkipAppRemoval,
   [string]$AppDir = '',
   [string]$Profile = '__WBS_DEFAULT_PROFILE__'
 )
 
+try {
+  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+  $isElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  $env:WBSWITCH_PRIVILEGE_MODE = if ($isElevated) { 'elevated' } else { 'standard' }
+} catch {
+  [Console]::Error.WriteLine('无法确认当前 PowerShell 的 Windows 权限模式；卸载已停止。')
+  exit 5
+}
+
+$ErrorActionPreference = 'Stop'
+try { . (Join-Path $PSScriptRoot 'windows-process-boundary.ps1') } catch {
+  [Console]::Error.WriteLine('无法加载 Windows 进程身份边界；卸载已停止。')
+  exit 5
+}
 $ErrorActionPreference = 'Continue'
 if ([string]::IsNullOrWhiteSpace($Profile) -or $Profile -eq '__WBS_DEFAULT_PROFILE__') { $Profile = 'workbuddy-cn' }
 if ($Profile -ne 'workbuddy-ai') { $Profile = 'workbuddy-cn' }
 $productName = if ($Profile -eq 'workbuddy-ai') { 'WorkDaddy AI' } else { 'WorkDaddy' }
 if ([string]::IsNullOrWhiteSpace($AppDir)) { $AppDir = Join-Path $env:LOCALAPPDATA (Join-Path 'Programs' $productName) }
+if (-not (Test-SameWindowsPath -Left $PSScriptRoot -Right (Join-Path $AppDir 'scripts'))) {
+  throw '卸载脚本位置与目标安装目录不一致，拒绝删除'
+}
 $dataRoot = Join-Path $env:APPDATA 'WorkDaddy'
 $dataDir = if ($Profile -eq 'workbuddy-ai') { Join-Path $dataRoot 'profiles\workbuddy-ai' } else { $dataRoot }
+$port = if ($Profile -eq 'workbuddy-ai') { 47833 } else { 47832 }
 
 Write-Host ('卸载 ' + $productName + '...')
 
-# 1) 移除登录自启（兼容 WorkDaddy / WorkDaddy AI 两个 profile）
+# 1) 只有在 watchdog/daemon 身份确认或明确不存在后才允许任何卸载写操作。
+Stop-VerifiedWorkDaddyLifecycle `
+  -DataDir $dataDir `
+  -Port $port `
+  -ExpectedWatchdogScript (Join-Path $AppDir 'scripts\watchdog.js') `
+  -ExpectedDaemonScript (Join-Path $AppDir 'scripts\daemon.js')
+
+# 2) 移除登录自启（兼容 WorkDaddy / WorkDaddy AI 两个 profile）
 try {
   foreach ($runName in @('WorkDaddy', 'WorkDaddy AI')) {
     Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name $runName -ErrorAction SilentlyContinue
@@ -25,30 +52,34 @@ try {
   Write-Host '  已移除登录自启项'
 } catch {}
 
-# 2) 停止 watchdog + daemon
-$pidFile = Join-Path $dataDir 'watchdog.pid'
-if (Test-Path $pidFile) {
+# 2.5) 删除桌面快捷方式（与 install-win.ps1 创建对称；只删当前 profile 的，
+#      绝不连带另一个 profile（WorkDaddy / WorkDaddy AI 各自卸载各自清理）
+$desktopDir = [Environment]::GetFolderPath('Desktop')
+if (-not $desktopDir) { $desktopDir = Join-Path $env:USERPROFILE 'Desktop' }
+$lnk = Join-Path $desktopDir ($productName + '.lnk')
+if (Test-Path -LiteralPath $lnk -PathType Leaf) {
   try {
-    $wpid = [int]((Get-Content $pidFile -Raw).Trim())
-    if ($wpid -gt 0) { taskkill /F /T /PID $wpid 2>$null | Out-Null }
-  } catch {}
-}
-foreach ($line in (netstat -ano | Select-String (':4783\d\s') | Select-String 'LISTENING')) {
-  $parts = ($line.ToString().Trim() -split '\s+')
-  $pid2 = $parts[$parts.Count - 1]
-  if ($pid2 -match '^\d+$') { taskkill /F /T /PID $pid2 2>$null | Out-Null }
+    Remove-Item -LiteralPath $lnk -Force -ErrorAction Stop
+    Write-Host ('  已删除桌面快捷方式: ' + $lnk)
+  } catch {
+    Write-Host ('  桌面快捷方式删除失败（可手动删除）: ' + $lnk + ' - ' + $_.Exception.Message)
+  }
 }
 
-# 3) 删除安装目录
-if (Test-Path $AppDir) {
-  Remove-Item -Recurse -Force $AppDir -ErrorAction SilentlyContinue
+# 3) 删除安装目录（Inno Setup 调用时由卸载器负责删除）
+if (-not $SkipAppRemoval -and (Test-Path $AppDir)) {
+  Remove-Item -LiteralPath $AppDir -Recurse -Force -ErrorAction Stop
+  if (Test-Path -LiteralPath $AppDir) { throw "安装目录删除失败: $AppDir" }
   Write-Host ('  已删除安装目录: ' + $AppDir)
+} elseif ($SkipAppRemoval) {
+  Write-Host '  已停止 WorkDaddy 生命周期，安装器将继续删除程序文件'
 }
 
 # 4) 数据目录（可选）
 if ($RemoveData) {
   if (Test-Path $dataDir) {
-    Remove-Item -Recurse -Force $dataDir -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $dataDir -Recurse -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $dataDir) { throw "数据目录删除失败: $dataDir" }
     Write-Host ('  已删除数据目录（含账号备份）: ' + $dataDir)
   }
 } else {

@@ -58,6 +58,142 @@ const AUTH_FILE = process.env.WBSWITCH_AUTH_FILE !== undefined
       ))));
 
 const LOGOUT_MARKER = `${AUTH_FILE}.logged-out`;
+const EXPLICIT_AUTH_FILE = process.env.WBSWITCH_AUTH_FILE !== undefined;
+const DYNAMIC_AUTH_DISCOVERY = !EXPLICIT_AUTH_FILE && !!ACTIVE_PROFILE.authFile && !!ACTIVE_PROFILE.capabilities.accounts;
+
+function authDir(file = AUTH_FILE) {
+  return file ? path.dirname(path.resolve(file)) : null;
+}
+
+function safeAuthFileName(name) {
+  const value = String(name || '');
+  return value.length > 0 && value.length <= 255 && path.basename(value) === value &&
+    !value.includes('\0') && !value.endsWith('.tmp') && /\.info$/i.test(value);
+}
+
+function normalizeAuthDomain(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  try {
+    const url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`);
+    return url.origin.toLowerCase().replace(/\/$/, '');
+  } catch (_) {
+    return '';
+  }
+}
+
+function tokenIssuerOrigin(accessToken) {
+  try {
+    const part = String(accessToken || '').split('.')[1];
+    if (!part) return '';
+    const padded = part.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (part.length % 4)) % 4);
+    const payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+    return normalizeAuthDomain(payload.iss);
+  } catch (_) {
+    return '';
+  }
+}
+
+function allowedAuthOrigins(profile = ACTIVE_PROFILE) {
+  const origins = new Set();
+  const profileOrigin = normalizeAuthDomain(profile.apiHost);
+  if (profileOrigin) origins.add(profileOrigin);
+  if (profile.region === 'cn') {
+    origins.add('https://www.workbuddy.cn');
+    origins.add('https://www.codebuddy.cn');
+    // 国内版新版 Keycloak issuer；保留旧域名以兼容已有账号备份。
+    origins.add('https://copilot.tencent.com');
+  } else if (profile.region === 'intl') {
+    origins.add('https://www.workbuddy.ai');
+    origins.add('https://www.codebuddy.ai');
+  }
+  return origins;
+}
+
+function authRecordFromJson(file, json, { strict = DYNAMIC_AUTH_DISCOVERY } = {}) {
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return null;
+  const acct = json.account || (Array.isArray(json.accounts) && json.accounts[0]) || null;
+  if (!acct || !acct.uid) return null;
+  const auth = json.auth && typeof json.auth === 'object' ? json.auth : {};
+  const accessToken = String(auth.accessToken || auth.access_token || auth.token || '');
+  const authDomain = normalizeAuthDomain(auth.domain || auth.issuer || '');
+  const authIssuer = tokenIssuerOrigin(accessToken);
+  if (strict) {
+    if (!accessToken) return null;
+    const allowed = allowedAuthOrigins();
+    if (![authDomain, authIssuer].some((origin) => origin && allowed.has(origin))) return null;
+  }
+  return {
+    uid: String(acct.uid),
+    nickname: acct.nickname || '',
+    uin: acct.uin || '',
+    phone: acct.phoneNumber || '',
+    type: acct.type || '',
+    raw: json,
+    file,
+    authFileName: file ? path.basename(file) : '',
+    authDomain,
+    authIssuer,
+    lastLogin: acct.lastLogin === true,
+    lastRefreshTime: Number(auth.lastRefreshTime) || 0,
+  };
+}
+
+function parseAuthFile(file, options = {}) {
+  if (!file || !fs.existsSync(file)) return null;
+  try {
+    const json = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return authRecordFromJson(file, json, options);
+  } catch (_) {
+    return null;
+  }
+}
+
+function listAuthRecords() {
+  if (!AUTH_FILE) return [];
+  if (!DYNAMIC_AUTH_DISCOVERY) {
+    const record = parseAuthFile(AUTH_FILE, { strict: false });
+    return record ? [record] : [];
+  }
+  const dir = authDir();
+  let names;
+  try { names = fs.readdirSync(dir); } catch (_) { return []; }
+  return names
+    .filter(safeAuthFileName)
+    .map((name) => parseAuthFile(path.join(dir, name)))
+    .filter(Boolean);
+}
+
+function resolveCurrentAuth() {
+  if (!DYNAMIC_AUTH_DISCOVERY) return { file: AUTH_FILE, record: parseAuthFile(AUTH_FILE, { strict: false }), ambiguous: false };
+  const records = listAuthRecords();
+  if (records.length === 1) return { file: records[0].file, record: records[0], ambiguous: false };
+  // 官方固定文件（workbuddy-desktop.info / workbuddy-desktop-ai.info）是官方实际读取的
+  // 当前登录文件：多份历史备份可能都残留 lastLogin 标记，只有固定文件是可信的「当前」。
+  // 固定文件有效时优先采用，避免被历史标记拖入 ambiguous 而拒绝切换/备份。
+  const canonical = records.find((record) => AUTH_FILE && path.resolve(record.file) === path.resolve(AUTH_FILE));
+  if (canonical) return { file: canonical.file, record: canonical, ambiguous: false };
+  const marked = records.filter((record) => record.lastLogin);
+  if (records.length > 1 && marked.length === 1) return { file: marked[0].file, record: marked[0], ambiguous: false };
+  return { file: null, record: null, ambiguous: records.length > 1, records };
+}
+
+function currentAuthFile() {
+  return resolveCurrentAuth().file;
+}
+
+function resolveLogoutAuth() {
+  const resolution = resolveCurrentAuth();
+  if (resolution.file || resolution.ambiguous || !DYNAMIC_AUTH_DISCOVERY) return resolution;
+  // 假退出已删掉登录文件，扫码取消后可以再次打开登录页。仅在认证目录
+  // 可读且没有任何 info 文件时使用官方固定路径；未知/损坏文件仍拒绝猜测。
+  try {
+    if (!fs.readdirSync(authDir()).some(safeAuthFileName)) {
+      return { file: AUTH_FILE, record: null, ambiguous: false };
+    }
+  } catch (_) { /* 不把权限或路径错误当成未登录 */ }
+  return resolution;
+}
 
 function defaultDataDir() {
   // 旧版 launchd 可能把 WBSWITCH_DATA_DIR 设成 HelloBuddy；新版本始终落到 WorkDaddy，
@@ -144,8 +280,8 @@ function sanitizeModel(model, opts) {
   };
 }
 
-function checkinDisplayValue(record, today, pending) {
-  if (pending || !record || record.date !== today) return null;
+function checkinDisplayValue(record, today) {
+  if (!record || record.date !== today || !record.ok) return null;
   return { ok: !!record.ok, already: !!record.already, code: record.code, message: record.message };
 }
 
@@ -205,21 +341,23 @@ function listModelBackups(dataDir) {
     const backupId = name.slice(0, -5);
     try {
       const { record } = readModelBackup(dataDir, backupId);
-      const summary = sanitizeModel(record.model, { revealKey: true });
-      records.push({ backupId, createdAt: record.createdAt || null, ...summary });
+      const model = record.model;
+      const id = typeof model.id === 'string' ? model.id.trim() : '';
+      const summary = sanitizeModel(model, { revealKey: true });
+      records.push({ backupId, createdAt: record.createdAt || null, ...summary, id });
     } catch (_) {
       // Ignore damaged files in the list; an explicit enable/delete still reports an error.
     }
   }
   records.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
-  const groups = {};
+  const groups = new Map();
   for (const record of records) {
+    // 分组严格依据原始模型配置的 id（模型名），不能使用用户自定义 name。
     const key = record.id || '(未命名模型)';
-    // 组名用模型名（id）：组内每个备份的自定义 name 可能不同，只有模型名一致
-    if (!groups[key]) groups[key] = { id: key, name: key, items: [] };
-    groups[key].items.push(record);
+    if (!groups.has(key)) groups.set(key, { id: key, items: [] });
+    groups.get(key).items.push(record);
   }
-  return Object.values(groups);
+  return Array.from(groups.values());
 }
 
 function listOfficialModels(file = workbuddyModelsFile()) {
@@ -286,13 +424,15 @@ function editModelBackup(dataDir, backupId, patch) {
   const { record } = readModelBackup(dataDir, backupId);
   const input = patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
   const model = Object.assign({}, record.model);
-  for (const field of ['name', 'url', 'apiKey']) {
+  // 模型名对应配置里的 id（例如 deepseek-v4-flash），name 是用户自定义的显示名称；两者都允许编辑。
+  for (const field of ['id', 'name', 'url', 'apiKey']) {
     if (!Object.prototype.hasOwnProperty.call(input, field)) continue;
     if (typeof input[field] !== 'string' || input[field].length > 20000) throw new Error(`模型${field}格式无效`);
     model[field] = input[field];
   }
   const modelId = String(model.id || model.name || '').trim();
   if (!modelId) throw new Error('模型备份缺少 id/name，无法保存');
+  model.id = modelId;
   if (!String(model.name || '').trim()) model.name = modelId;
   const updated = Object.assign({}, record, { model });
   writeModelBackup(dataDir, updated);
@@ -394,7 +534,9 @@ function canonicalWorkspace(cwd) {
   value = path.posix.normalize(value);
   if (value === '.') return '';
   if (value.length > 1) value = value.replace(/\/+$/, '');
-  return IS_WIN ? value.toLowerCase() : value;
+  // Windows filesystem matching is case-insensitive, but this key is also
+  // displayed to users and must retain WorkBuddy's original path spelling.
+  return value;
 }
 
 function ensureAutoCopyMeta(meta) {
@@ -406,7 +548,7 @@ function ensureAutoCopyMeta(meta) {
   // 1.0.15 stored rules under sourceUid. Convert them once to global session lineages
   // and global workspace paths so a migration/copy keeps the same shared identity.
   const legacy = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
-  const next = { version: 2, sessions: {}, sessionIndex: {}, workspaces: {}, copies: {} };
+  const next = { version: 2, allSessions: false, sessions: {}, sessionIndex: {}, workspaces: {}, copies: {} };
   const legacySessions = legacy.sessions && typeof legacy.sessions === 'object' ? legacy.sessions : {};
   for (const sourceUid of Object.keys(legacySessions)) {
     const bucket = legacySessions[sourceUid];
@@ -449,6 +591,7 @@ function readAutoCopyConfig(dataDir) {
   const autoCopy = ensureAutoCopyMeta(meta);
   if (!wasCurrent) writeMeta(dataDir, meta);
   return {
+    allSessions: autoCopy.allSessions === true,
     sessions: autoCopy.sessions,
     sessionIndex: autoCopy.sessionIndex,
     workspaces: autoCopy.workspaces,
@@ -466,19 +609,59 @@ function getAutoCopyRules(dataDir, uid) {
   const index = config.sessionIndex[sourceUid] || {};
   const sessionIds = [];
   const lineages = {};
+  const allLineages = {};
   for (const sessionId of Object.keys(index)) {
     const lineageId = index[sessionId];
     const lineage = config.sessions[lineageId];
+    if (lineage) allLineages[sessionId] = lineageId;
     if (lineage && lineage.enabled !== false) {
       sessionIds.push(sessionId);
       lineages[sessionId] = lineageId;
     }
   }
   return {
+    allSessions: config.allSessions === true,
     sessionIds,
     lineages,
+    allLineages,
     workspaces: Object.keys(config.workspaces),
   };
+}
+
+// A lineage represents one logical session per account. Older copies can
+// leave multiple physical rows indexed under the same lineage; keep the first
+// row (the SQL callers order newest activity first) for plans and UI counts.
+function dedupeAutoCopySessionRows(rows, lineagesByUid) {
+  if (!Array.isArray(rows)) return [];
+  const seen = new Set();
+  return rows.filter((row) => {
+    const uid = String(row && row.user_id || '').trim();
+    const id = String(row && row.id || '').trim();
+    const lineageId = lineagesByUid && lineagesByUid[uid] && lineagesByUid[uid][id];
+    if (!lineageId) return true;
+    const key = uid + '::' + String(lineageId);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function setAutoCopyAllSessions(dataDir, enabled) {
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  config.allSessions = enabled === true;
+  writeMeta(dataDir, meta);
+  return { allSessions: config.allSessions };
+}
+
+function isAutoCopySessionSelected(rules, session) {
+  if (rules && rules.allSessions === true) return true;
+  const sessionId = String(session && session.id || '');
+  const workspace = canonicalWorkspace(session && session.cwd);
+  const sessionIds = rules && Array.isArray(rules.sessionIds) ? rules.sessionIds : [];
+  const workspaces = rules && Array.isArray(rules.workspaces) ? rules.workspaces : [];
+  return sessionIds.some((id) => String(id) === sessionId)
+    || workspaces.some((cwd) => canonicalWorkspace(cwd) === workspace);
 }
 
 function setAutoCopyRule(dataDir, { uid, kind, key, enabled }) {
@@ -531,22 +714,131 @@ function getAutoCopySession(dataDir, uid, sessionId) {
   return { lineageId: lineageId || null, enabled: !!(lineage && lineage.enabled !== false) };
 }
 
-function ensureAutoCopySession(dataDir, uid, sessionId) {
+// Return all persisted session ids for one account in a lineage.  A lineage
+// should have at most one live session per uid, but keeping the full list lets
+// the copier repair stale mappings without creating another row.
+function getAutoCopySessionMembers(dataDir, lineageId, uid) {
+  const config = readAutoCopyConfig(dataDir);
+  const lineage = config.sessions[String(lineageId || '')];
+  if (!lineage || !Array.isArray(lineage.members)) return [];
+  const targetUid = uid === undefined || uid === null ? null : String(uid);
+  const seen = new Set();
+  const result = [];
+  for (const member of lineage.members) {
+    if (!member || (targetUid !== null && String(member.uid || '') !== targetUid)) continue;
+    const id = String(member.id || '').trim();
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      result.push(id);
+    }
+  }
+  return result;
+}
+
+// Return the de-duplicated account/session pairs for a lineage.  The copier
+// needs the uid as well as the id so it can refresh every live account member,
+// not only the account that happened to be active during the switch.
+function getAutoCopySessionMemberRecords(dataDir, lineageId) {
+  const config = readAutoCopyConfig(dataDir);
+  const lineage = config.sessions[String(lineageId || '')];
+  if (!lineage || !Array.isArray(lineage.members)) return [];
+  const seen = new Set();
+  const result = [];
+  for (const member of lineage.members) {
+    const uid = String(member && member.uid || '').trim();
+    const id = String(member && member.id || '').trim();
+    if (!uid || !id) continue;
+    const key = JSON.stringify([uid, id]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ uid, id });
+  }
+  return result;
+}
+
+// Pick the freshest member snapshot.  Message files are authoritative; the
+// database timestamp is only a deterministic fallback for legacy/missing
+// files.  Ties are resolved by member order so repeated switches stay stable.
+function selectLatestAutoCopyMember(members) {
+  if (!Array.isArray(members) || !members.length) return null;
+  let best = null;
+  members.forEach((member, index) => {
+    if (!member || !member.id) return;
+    const contentMtime = Number(member.contentMtime || 0);
+    const updatedAt = Number(member.updatedAt || 0);
+    if (!best || contentMtime > best.contentMtime ||
+        (contentMtime === best.contentMtime && updatedAt > best.updatedAt)) {
+      best = Object.assign({ memberIndex: index }, member, { contentMtime, updatedAt });
+    }
+  });
+  return best ? members[best.memberIndex] : null;
+}
+
+function ensureAutoCopySessions(dataDir, uid, sessionIds, options) {
   const meta = readMeta(dataDir);
   const config = ensureAutoCopyMeta(meta);
   const sourceUid = String(uid || '').trim();
-  const id = String(sessionId || '').trim();
-  if (!sourceUid || !id) throw new Error('缺少共享会话标识');
+  const ids = Array.from(new Set((Array.isArray(sessionIds) ? sessionIds : [sessionIds])
+    .map((id) => String(id || '').trim())
+    .filter(Boolean)));
+  if (!sourceUid || !ids.length) throw new Error('缺少共享会话标识');
   if (!config.sessionIndex[sourceUid]) config.sessionIndex[sourceUid] = {};
-  let lineageId = config.sessionIndex[sourceUid][id];
-  if (!lineageId || !config.sessions[lineageId]) {
-    lineageId = crypto.randomUUID();
-    config.sessions[lineageId] = { enabled: true, members: [], createdAt: Date.now() };
-    config.sessionIndex[sourceUid][id] = lineageId;
-  }
-  addLineageMember(config.sessions[lineageId], sourceUid, id);
+  const lineages = {};
+  ids.forEach((id) => {
+    let lineageId = config.sessionIndex[sourceUid][id];
+    if (!lineageId || !config.sessions[lineageId]) {
+      lineageId = crypto.randomUUID();
+      config.sessions[lineageId] = { enabled: !(options && options.enabled === false), members: [], createdAt: Date.now() };
+      config.sessionIndex[sourceUid][id] = lineageId;
+    }
+    addLineageMember(config.sessions[lineageId], sourceUid, id);
+    lineages[id] = lineageId;
+  });
   writeMeta(dataDir, meta);
-  return lineageId;
+  return lineages;
+}
+
+function ensureAutoCopySession(dataDir, uid, sessionId, options) {
+  const id = String(sessionId || '').trim();
+  if (!id) throw new Error('缺少共享会话标识');
+  return ensureAutoCopySessions(dataDir, uid, [id], options)[id];
+}
+
+// Keep the core lineage invariant: one physical session per account in each
+// lineage. Older copy jobs could append a second session for the same account
+// when a mapping was stale. Preserve every physical row, but move duplicates
+// to their own lineage so the next all-session reconciliation can pair them.
+function normalizeAutoCopyLineages(dataDir) {
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  let changed = false;
+  for (const lineageId of Object.keys(config.sessions)) {
+    const lineage = config.sessions[lineageId];
+    if (!lineage || !Array.isArray(lineage.members)) continue;
+    const seenUids = new Set();
+    const kept = [];
+    for (const member of lineage.members) {
+      const uid = String(member && member.uid || '').trim();
+      const id = String(member && member.id || '').trim();
+      if (!uid || !id || !seenUids.has(uid)) {
+        if (uid) seenUids.add(uid);
+        kept.push(member);
+        continue;
+      }
+      const replacementId = crypto.randomUUID();
+      config.sessions[replacementId] = {
+        enabled: lineage.enabled !== false,
+        members: [{ uid, id }],
+        createdAt: Date.now(),
+      };
+      if (!config.sessionIndex[uid]) config.sessionIndex[uid] = {};
+      config.sessionIndex[uid][id] = replacementId;
+      changed = true;
+    }
+    if (kept.length !== lineage.members.length) lineage.members = kept;
+  }
+  if (changed) writeMeta(dataDir, meta);
+  return changed;
 }
 
 function addAutoCopySessionMember(dataDir, lineageId, uid, sessionId) {
@@ -565,6 +857,29 @@ function addAutoCopySessionMember(dataDir, lineageId, uid, sessionId) {
   }
   config.sessionIndex[sourceUid][id] = String(lineageId);
   addLineageMember(lineage, sourceUid, id);
+  writeMeta(dataDir, meta);
+  return true;
+}
+
+// Remove only one member from a lineage.  Unlike removeAutoCopySession this
+// intentionally leaves the lineage and other account members intact.
+function removeAutoCopySessionMember(dataDir, lineageId, uid, sessionId) {
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  const id = String(lineageId || '').trim();
+  const sourceUid = String(uid || '').trim();
+  const sessionIdValue = String(sessionId || '').trim();
+  const lineage = config.sessions[id];
+  if (!lineage || !sourceUid || !sessionIdValue) return false;
+  const before = Array.isArray(lineage.members) ? lineage.members.length : 0;
+  lineage.members = (lineage.members || []).filter((member) => !(member && String(member.uid || '') === sourceUid && String(member.id || '') === sessionIdValue));
+  if (config.sessionIndex[sourceUid] && config.sessionIndex[sourceUid][sessionIdValue] === id) {
+    delete config.sessionIndex[sourceUid][sessionIdValue];
+    if (!Object.keys(config.sessionIndex[sourceUid]).length) delete config.sessionIndex[sourceUid];
+  }
+  const mappingKey = autoCopyRuleKey(id, sourceUid);
+  if (config.copies[mappingKey] && String(config.copies[mappingKey].targetId || '') === sessionIdValue) delete config.copies[mappingKey];
+  if (before === lineage.members.length) return false;
   writeMeta(dataDir, meta);
   return true;
 }
@@ -613,6 +928,60 @@ function removeAutoCopySession(dataDir, uid, sessionId) {
   }
   writeMeta(dataDir, meta);
   return true;
+}
+
+// 真实删除路径的展开器：把要删除的会话按 lineage 扩展到全部物理副本（其他
+// 账号自动复制出来的同源会话）。否则删除某个账号的会话后，副本仍留在其他
+// 账号，切换回来时 auto-copy 会把它们原样复制回来（用户观察到的「删除后
+// 切走再切回、会话复活」现象）。无 lineage 的会话映射回自身。
+// 返回 [{ uid, id, lineageId }]；uid 可能为空（脏索引），id 必有值。
+function collectLineageMembersForDelete(dataDir, sessionIds) {
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  const ids = new Set(
+    (Array.isArray(sessionIds) ? sessionIds : [])
+      .map((s) => String(s || '').trim())
+      .filter(Boolean)
+  );
+  if (!ids.size) return [];
+  // 跨账号全表反向索引：sessionId -> lineageId（会话 id 全局唯一）
+  const lineageBySession = new Map();
+  for (const owner of Object.keys(config.sessionIndex || {})) {
+    const index = config.sessionIndex[owner] || {};
+    for (const sessionId of Object.keys(index)) {
+      const lineageId = String(index[sessionId] || '');
+      if (lineageId) lineageBySession.set(sessionId, lineageId);
+    }
+  }
+  const members = [];
+  const seenKeys = new Set();
+  const seenLineages = new Set();
+  const addMember = (memberUid, memberId, lineageId) => {
+    const uid = String(memberUid || '').trim();
+    const id = String(memberId || '').trim();
+    if (!id) return;
+    const key = (uid || '*') + '::' + id;
+    if (seenKeys.has(key)) return;
+    seenKeys.add(key);
+    members.push({ uid, id, lineageId: String(lineageId || '') });
+  };
+  for (const id of ids) {
+    const lineageId = lineageBySession.get(id);
+    if (!lineageId || !config.sessions[lineageId]) {
+      addMember('', id, '');
+      continue;
+    }
+    if (seenLineages.has(lineageId)) continue;
+    seenLineages.add(lineageId);
+    const lineage = config.sessions[lineageId];
+    const lineageMembers = Array.isArray(lineage.members) ? lineage.members : [];
+    if (!lineageMembers.length) {
+      addMember('', id, lineageId);
+      continue;
+    }
+    lineageMembers.forEach((m) => addMember(m && m.uid, m && m.id, lineageId));
+  }
+  return members;
 }
 
 function removeAutoCopyAccount(dataDir, uid) {
@@ -690,11 +1059,12 @@ function backupPath(dataDir, uid) {
 }
 
 /** WorkBuddy ignores auth files while this marker exists; retire it after a switch. */
-function retireLogoutMarker(log = () => {}) {
-  if (!fs.existsSync(LOGOUT_MARKER)) return false;
+function retireLogoutMarker(log = () => {}, file = AUTH_FILE) {
+  const marker = file ? `${file}.logged-out` : LOGOUT_MARKER;
+  if (!marker || !fs.existsSync(marker)) return false;
   try {
-    const retired = `${LOGOUT_MARKER}.retired.${process.pid}.${Date.now()}`;
-    fs.renameSync(LOGOUT_MARKER, retired);
+    const retired = `${marker}.retired.${process.pid}.${Date.now()}`;
+    fs.renameSync(marker, retired);
     try {
       fs.unlinkSync(retired);
     } catch (_) {
@@ -709,7 +1079,7 @@ function retireLogoutMarker(log = () => {}) {
     // WorkBuddy may launch the daemon in a sandbox that cannot unlink auth files.
     try {
       const { execFileSync } = require('child_process');
-      const markerQ = LOGOUT_MARKER.replace(/"/g, '\\"');
+      const markerQ = marker.replace(/"/g, '\\"');
       execFileSync('osascript', ['-e', `do shell script "rm -f \\\"${markerQ}\\\""`], {
         timeout: 15000,
         stdio: 'pipe',
@@ -783,39 +1153,35 @@ function ensureDirs(dataDir, log = () => {}) {
 }
 
 /** 读取登录信息文件并抽取账号关键字段（不返回令牌内容） */
-function readAuthFile() {
+function readAuthFile(file = currentAuthFile()) {
   if (!ACTIVE_PROFILE.authFile && !process.env.WBSWITCH_AUTH_FILE) {
     throw new Error(`${ACTIVE_PROFILE.name} 没有可读取的明文认证文件`);
   }
-  const raw = fs.readFileSync(AUTH_FILE, 'utf8');
-  const json = JSON.parse(raw);
-  if (!json || typeof json !== 'object') {
-    throw new Error('auth 文件不是有效的 JSON 对象');
-  }
-  const acct = json.account || (Array.isArray(json.accounts) && json.accounts[0]) || null;
-  if (!acct || !acct.uid) {
-    throw new Error('auth 文件中未找到 account.uid');
-  }
-  return {
-    uid: acct.uid,
-    nickname: acct.nickname || '',
-    uin: acct.uin || '',
-    phone: acct.phoneNumber || '',
-    type: acct.type || '',
-    raw: json,
-  };
+  if (!file) throw new Error('未找到唯一的当前登录信息文件');
+  const info = parseAuthFile(file, { strict: DYNAMIC_AUTH_DISCOVERY });
+  if (!info) throw new Error(`auth 文件无效或不属于当前客户端: ${path.basename(file)}`);
+  return info;
 }
 
-/** 更新 meta.json（uid -> nickname/uin/phone/时间） */
-function updateMeta(dataDir, info) {
+/** 更新 meta.json（uid -> nickname/uin/phone/时间）。preserveBinding：备份扫描路径
+ *  不漂移「账号 -> 登录文件」绑定——auth 目录里的个性化历史存档（带时间戳）即使
+ *  残留 lastLogin 标记，也不得覆盖切换路径建立的绑定关系。 */
+function updateMeta(dataDir, info, { preserveBinding = false } = {}) {
   const meta = readMeta(dataDir);
   const now = Date.now();
   const prev = meta.accounts[info.uid] || {};
+  let authFileName = info.authFileName || prev.authFileName || '';
+  if (preserveBinding && prev.authFileName && info.authFileName && prev.authFileName !== info.authFileName) {
+    authFileName = prev.authFileName;
+  }
   meta.accounts[info.uid] = {
     uid: info.uid,
     nickname: info.nickname || prev.nickname || '',
     uin: info.uin || prev.uin || '',
     phone: info.phone || prev.phone || '',
+    authFileName,
+    authDomain: info.authDomain || prev.authDomain || '',
+    authIssuer: info.authIssuer || prev.authIssuer || '',
     firstSeen: prev.firstSeen || now,
     lastSeen: now,
   };
@@ -823,21 +1189,80 @@ function updateMeta(dataDir, info) {
   return meta;
 }
 
-/** 把当前登录信息备份到 accounts/<uid>.info（原子写入，0600） */
+function backupAuthFile(dataDir, file, log = () => {}) {
+  const info = readAuthFile(file);
+  const dest = backupPath(dataDir, info.uid);
+  const tmp = dest + '.tmp';
+  fs.writeFileSync(tmp, fs.readFileSync(file), { mode: 0o600 });
+  fs.renameSync(tmp, dest);
+  fs.chmodSync(dest, 0o600);
+  updateMeta(dataDir, info, { preserveBinding: true });
+  log(`[sync] 已备份账号 ${info.nickname || info.uid} (${info.uid}) -> ${dest}`);
+  return info;
+}
+
+/** 把活动登录信息备份到 accounts/<uid>.info（原子写入，0600）。
+ *  已有同名备份的账号只接受「官方权威登录位」（固定文件/当前登录位）作为更新源：
+ *  auth 目录里的个性化历史存档（同 uid、老 token、残留 lastLogin 标记）不允许
+ *  覆盖有效备份——否则切换会写入早已失效的旧 refresh token，导致官方身份过期
+ *  （真实事故：s 账号备份曾被 2026-08-21 存档覆盖成 8-19 的 token）。 */
 function backupCurrent(dataDir, log = () => {}) {
   if (!ACTIVE_PROFILE.capabilities.accounts) throw new Error(`${ACTIVE_PROFILE.name} 暂不支持账号文件备份`);
   ensureDirs(dataDir, log);
-  const info = readAuthFile();
-  const dest = backupPath(dataDir, info.uid);
-  const tmp = dest + '.tmp';
-  fs.writeFileSync(tmp, fs.readFileSync(AUTH_FILE), { mode: 0o600 });
-  fs.renameSync(tmp, dest);
-  fs.chmodSync(dest, 0o600);
-  updateMeta(dataDir, info);
-  log(
-    `[sync] 已备份账号 ${info.nickname || info.uid} (${info.uid}) -> ${dest}`
-  );
-  return info;
+  const records = listAuthRecords();
+  if (!records.length) throw new Error('未找到有效的登录信息文件');
+  const current = resolveCurrentAuth();
+  let result = null;
+  let backedUp = 0;
+  for (const record of records) {
+    const authoritative = current.file && samePath(record.file, current.file);
+    const existingBackup = fs.existsSync(backupPath(dataDir, record.uid));
+    if (existingBackup && !authoritative) continue; // 历史存档不覆盖已有备份
+    const info = backupAuthFile(dataDir, record.file, log);
+    backedUp += 1;
+    if (!result || authoritative) result = info;
+  }
+  return Object.assign(result || {}, { backedUp, ambiguous: !!current.ambiguous });
+}
+
+function resolveAuthTarget(dataDir, uid, authJson) {
+  if (!DYNAMIC_AUTH_DISCOVERY) return AUTH_FILE;
+  const meta = readMeta(dataDir);
+  const record = meta.accounts[String(uid)] || {};
+  const backup = authRecordFromJson(null, authJson);
+  if (!backup) throw new Error('备份文件认证数据无效，拒绝切换');
+  const sameChannel = (candidate) => {
+    const expected = new Set([backup.authIssuer, backup.authDomain].filter(Boolean));
+    return [candidate && candidate.authIssuer, candidate && candidate.authDomain]
+      .some((origin) => origin && expected.has(origin));
+  };
+  // 官方固定登录位（workbuddy-desktop.info / workbuddy-desktop-ai.info）是官方实际
+  // 读取的当前登录文件。它存在时，所有显式切换一律写这里——个性化历史存档（带时间戳
+  // 的 info）只是官方多账号机制的存档，写了官方也不读。切换后 updateMeta 会同步修正
+  // 「账号 -> 登录文件」绑定，历史上被备份扫描漂移到旧文件的记录在此自愈。
+  if (AUTH_FILE && parseAuthFile(AUTH_FILE)) return AUTH_FILE;
+  const targetName = safeAuthFileName(record.authFileName) ? record.authFileName : '';
+  if (targetName) {
+    const target = path.join(authDir(), targetName);
+    if (path.dirname(path.resolve(target)) !== path.resolve(authDir())) throw new Error('登录文件目标路径无效');
+    const existing = fs.existsSync(target) ? parseAuthFile(target) : null;
+    if (fs.existsSync(target) && !existing) throw new Error('登录文件目标不是当前客户端的有效认证文件，拒绝覆盖');
+    if (existing && !sameChannel(existing)) throw new Error('登录文件目标属于其他认证通道，拒绝覆盖');
+    return target;
+  }
+  const records = listAuthRecords();
+  const matching = records.filter((item) => item.uid === String(uid));
+  if (matching.length === 1) return matching[0].file;
+  const channelMatches = records.filter(sameChannel);
+  const canonical = channelMatches.find((item) => AUTH_FILE && samePath(item.file, AUTH_FILE));
+  if (canonical) return canonical.file;
+  if (channelMatches.length === 1) return channelMatches[0].file;
+  const legacyRecord = String(record.uid || '') === String(uid) &&
+    !record.authFileName && !record.authDomain && !record.authIssuer;
+  // legacy 账号（动态发现上线前备份）没有属于自己的文件记录，其唯一正确的落点就是
+  // 官方固定登录文件（AUTH_FILE）；无论该文件当前是否被占用，用户显式切换即意图覆盖。
+  if (legacyRecord && AUTH_FILE) return AUTH_FILE;
+  throw new Error('账号缺少已确认的登录文件名，拒绝猜测写入目标');
 }
 
 /** 列出所有已备份账号（直接读备份文件提取展示字段，按最近刷新时间倒序） */
@@ -872,6 +1297,8 @@ function listAccounts(dataDir) {
         item.nickname = acct.nickname || '';
         item.phone = acct.phoneNumber || '';
         item.uin = acct.uin || '';
+        item.type = typeof acct.type === 'string' ? acct.type : '';
+        item.enterpriseName = typeof acct.enterpriseName === 'string' ? acct.enterpriseName.trim() : '';
       }
       if (j.auth) {
         item.tokenExpiresAt = j.auth.expiresAt || null;
@@ -888,15 +1315,69 @@ function listAccounts(dataDir) {
   );
 }
 
+/** 删除 auth 目录中属于该 uid 的全部登录文件（官方固定文件 + 带时间戳的历史存档）。
+ *  只删 listAuthRecords 能发现（parseAuthFile 可解析并匹配）的记录，确保之后的
+ *  backupCurrent 扫描不会再把这个账号重新备份回来——这是「删除账号重启后又出现」
+ *  的根因：删除只清了 backups 目录，auth 目录里残留的存档会在下一次扫描时复活账号。 */
+function deleteAuthFilesForUid(uid, log = () => {}) {
+  if (!AUTH_FILE) return { removed: 0 };
+  if (!DYNAMIC_AUTH_DISCOVERY) {
+    const record = parseAuthFile(AUTH_FILE, { strict: false });
+    if (record && record.uid === uid && fs.existsSync(AUTH_FILE)) {
+      fs.unlinkSync(AUTH_FILE);
+      log(`[delete] 已删除固定登录文件 ${path.basename(AUTH_FILE)}`);
+      return { removed: 1 };
+    }
+    return { removed: 0 };
+  }
+  const dir = authDir();
+  let names;
+  try { names = fs.readdirSync(dir); } catch (_) { return { removed: 0 }; }
+  let removed = 0;
+  for (const name of names) {
+    if (!safeAuthFileName(name)) continue;
+    const file = path.join(dir, name);
+    const record = parseAuthFile(file);
+    if (record && record.uid === uid && fs.existsSync(file)) {
+      try {
+        fs.unlinkSync(file);
+        removed += 1;
+      } catch (e) {
+        log(`[delete] 删除认证存档 ${name} 失败: ${e.message}`);
+      }
+    }
+  }
+  return { removed };
+}
+
 /** 永久删除某个账号的备份文件（不影响当前登录） */
-function deleteAccount(dataDir, uid) {
+function deleteAccount(dataDir, uid, log = () => {}) {
   if (!ACTIVE_PROFILE.capabilities.accounts) throw new Error(`${ACTIVE_PROFILE.name} 暂不支持账号切换`);
+  // 防御：面板已对当前登录账号隐藏删除按钮；走到这里说明状态异常，
+  // 拒绝直接删官方正在读取的登录位（删了 WorkBuddy 也会重新写回，删不干净）。
+  const current = resolveCurrentAuth();
+  if (current.file && !current.ambiguous) {
+    const record = parseAuthFile(current.file, { strict: false });
+    if (record && record.uid === uid) {
+      throw new Error('不能删除当前登录的账号（请先退出登录或切换到其他账号）');
+    }
+  }
   migrateLegacyDataDir(dataDir);
-  const file = backupPath(dataDir, uid);
+  // 关键：先清掉 auth 目录里该 uid 的全部登录文件（固定文件 + 历史存档），
+  // 否则 backupCurrent 的下一次扫描会把账号重新备份回来（删除后复活的根因）。
+  const authResult = deleteAuthFilesForUid(uid, log);
+  const files = [backupPath(dataDir, uid)];
+  // 旧版 HelloBuddy 目录仍会在每次启动时迁移缺失的账号备份。删除新目录
+  // 的文件后若留下旧源文件，下一次 daemon 启动就会把账号重新复制回来。
+  if (!IS_WIN && samePath(dataDir, PLATFORM_DATA_DIR)) {
+    files.push(backupPath(LEGACY_DATA_DIR, uid));
+  }
   let deletedFile = false;
-  if (fs.existsSync(file)) {
-    fs.unlinkSync(file);
-    deletedFile = true;
+  for (const file of files) {
+    if (fs.existsSync(file)) {
+      fs.unlinkSync(file);
+      deletedFile = true;
+    }
   }
   const mf = metaFile(dataDir);
   try {
@@ -908,13 +1389,16 @@ function deleteAccount(dataDir, uid) {
   } catch (_) {
     /* meta 不存在则忽略 */
   }
-  return { deleted: deletedFile, uid };
+  return { deleted: deletedFile, uid, authFilesRemoved: authResult.removed };
 }
 
 /** 切换登录账号：把备份文件复制回登录信息文件（先校验 uid 匹配） */
 function switchTo(dataDir, uid, log = () => {}) {
   if (!ACTIVE_PROFILE.capabilities.accounts) throw new Error(`${ACTIVE_PROFILE.name} 暂不支持账号切换`);
   migrateLegacyDataDir(dataDir, log);
+  // 不再用「当前 auth 目录是否 ambiguous」一票否决：切换写入的目标文件由
+  // resolveAuthTarget 精确决定（meta.json 记录 / 唯一 uid 匹配），目标无法唯一
+  // 确定时它自己会拒绝，避免历史 lastLogin 残留导致已登录账号切不回去。
   const src = backupPath(dataDir, uid);
   if (!fs.existsSync(src)) {
     throw new Error(`未找到账号 ${uid} 的备份文件`);
@@ -925,11 +1409,13 @@ function switchTo(dataDir, uid, log = () => {}) {
   if (!acct || acct.uid !== uid) {
     throw new Error('备份文件校验失败：uid 不匹配，已中止切换');
   }
-  const tmp = AUTH_FILE + '.wbswitch.tmp';
+  const target = resolveAuthTarget(dataDir, uid, json);
+  if (!target) throw new Error('未找到该账号已记录的登录文件名，拒绝猜测写入目标');
+  const tmp = target + '.wbswitch.tmp';
   try {
     fs.writeFileSync(tmp, raw, { mode: 0o600 });
-    fs.renameSync(tmp, AUTH_FILE);
-    fs.chmodSync(AUTH_FILE, 0o600);
+    fs.renameSync(tmp, target);
+    fs.chmodSync(target, 0o600);
   } catch (e) {
     // 沙箱环境（如从 WorkBuddy 托管后台运行）直接写系统目录会 EPERM。
     // macOS 回退：osascript 委托 GUI 会话复制（不涉及内容转义，只传路径）。
@@ -941,9 +1427,9 @@ function switchTo(dataDir, uid, log = () => {}) {
     }
     log(`[switch] 直写失败(${e.code})，改用 osascript 委托写入`);
     const bridge = path.join(dataDir, '.auth-switch-bridge.tmp');
-    const authBridge = AUTH_FILE + '.wbswitch.tmp';
+    const authBridge = target + '.wbswitch.tmp';
     const bridgeQ = bridge.replace(/"/g, '\\"');
-    const authQ = AUTH_FILE.replace(/"/g, '\\"');
+    const authQ = target.replace(/"/g, '\\"');
     const tmpQ = authBridge.replace(/"/g, '\\"');
     try {
       // 1) 本进程写 bridge（数据目录可写）
@@ -957,13 +1443,33 @@ function switchTo(dataDir, uid, log = () => {}) {
       throw new Error(`写入登录文件失败: ${(e2.message || e2).toString().slice(0, 200)}`);
     }
   }
-  retireLogoutMarker(log);
+  // Legacy call shape retained for source-compatible launchers: retireLogoutMarker(log);
+  retireLogoutMarker(log, target);
+  updateMeta(dataDir, {
+    uid: acct.uid,
+    nickname: acct.nickname || '',
+    uin: acct.uin || '',
+    phone: acct.phoneNumber || '',
+    authFileName: path.basename(target),
+    authDomain: normalizeAuthDomain(json.auth && json.auth.domain),
+    authIssuer: tokenIssuerOrigin(json.auth && (json.auth.accessToken || json.auth.access_token)),
+  });
   log(`[switch] 已切换登录账号为 ${acct.nickname || uid} (${uid})`);
-  return { uid: acct.uid, nickname: acct.nickname || '', uin: acct.uin || '' };
+  return { uid: acct.uid, nickname: acct.nickname || '', uin: acct.uin || '', authFile: target };
 }
 
 module.exports = {
   AUTH_FILE,
+  authDir,
+  safeAuthFileName,
+  normalizeAuthDomain,
+  tokenIssuerOrigin,
+  parseAuthFile,
+  listAuthRecords,
+  resolveCurrentAuth,
+  resolveLogoutAuth,
+  currentAuthFile,
+  resolveAuthTarget,
   ACTIVE_PROFILE,
   defaultDataDir,
   migrateLegacyDataDir,
@@ -993,13 +1499,23 @@ module.exports = {
   updateMeta,
   canonicalWorkspace,
   getAutoCopyRules,
+  dedupeAutoCopySessionRows,
   setAutoCopyRule,
+  setAutoCopyAllSessions,
+  isAutoCopySessionSelected,
   getAutoCopySession,
+  getAutoCopySessionMembers,
+  getAutoCopySessionMemberRecords,
+  selectLatestAutoCopyMember,
+  ensureAutoCopySessions,
   ensureAutoCopySession,
+  normalizeAutoCopyLineages,
   addAutoCopySessionMember,
+  removeAutoCopySessionMember,
   moveAutoCopySession,
   removeAutoCopySession,
   removeAutoCopyAccount,
+  collectLineageMembersForDelete,
   getAutoCopyMapping,
   setAutoCopyMapping,
   deleteAutoCopyMapping,

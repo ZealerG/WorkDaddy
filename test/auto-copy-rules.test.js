@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const childProcess = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -11,13 +12,24 @@ const {
   canonicalWorkspace,
   getAutoCopyRules,
   setAutoCopyRule,
+  setAutoCopyAllSessions,
+  isAutoCopySessionSelected,
+  dedupeAutoCopySessionRows,
   getAutoCopySession,
+  ensureAutoCopySession,
+  ensureAutoCopySessions,
+  normalizeAutoCopyLineages,
+  getAutoCopySessionMembers,
   addAutoCopySessionMember,
+  removeAutoCopySessionMember,
   moveAutoCopySession,
   removeAutoCopySession,
   removeAutoCopyAccount,
+  collectLineageMembersForDelete,
   setAutoCopyMapping,
   getAutoCopyMapping,
+  getAutoCopySessionMemberRecords,
+  selectLatestAutoCopyMember,
   listOfficialModels,
   maskApiKey,
   sanitizeModel,
@@ -32,6 +44,16 @@ const {
   checkinDisplayValue,
 } = require('../scripts/lib.js');
 
+test('lineage sync selects the newest live member instead of trusting the switching source', () => {
+  const members = [
+    { uid: 'account-a', id: 'copy-a', contentMtime: 100, updatedAt: 500 },
+    { uid: 'account-b', id: 'copy-b', contentMtime: 300, updatedAt: 100 },
+    { uid: 'account-c', id: 'copy-c', contentMtime: 200, updatedAt: 900 },
+  ];
+  assert.deepEqual(selectLatestAutoCopyMember(members), members[1]);
+  assert.deepEqual(selectLatestAutoCopyMember([]), null);
+});
+
 function tempDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-auto-copy-'));
 }
@@ -39,6 +61,16 @@ function tempDataDir() {
 function writeMeta(dataDir, value) {
   fs.writeFileSync(metaFile(dataDir), JSON.stringify(value, null, 2), { mode: 0o600 });
 }
+
+test('Windows workspace keys retain the renderer-provided path spelling', () => {
+  const result = childProcess.spawnSync(
+    process.execPath,
+    ['-e', "Object.defineProperty(process, 'platform', { value: 'win32' }); const { canonicalWorkspace } = require(process.argv[1]); process.stdout.write(canonicalWorkspace('/Users/example/Repo/'));", path.join(__dirname, '..', 'scripts', 'lib.js')],
+    { encoding: 'utf8' }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, '/Users/example/Repo');
+});
 
 test('legacy account-scoped rules migrate to global lineages and workspace paths', () => {
   const dataDir = tempDataDir();
@@ -56,7 +88,8 @@ test('legacy account-scoped rules migrate to global lineages and workspace paths
   const rules = getAutoCopyRules(dataDir, 'h');
   assert.deepEqual(rules.sessionIds, ['session-a']);
   assert.equal(rules.workspaces.length, 1);
-  assert.equal(canonicalWorkspace('/Users/example/Repo/'), '/Users/example/Repo');
+  const expectedWorkspace = '/Users/example/Repo';
+  assert.equal(canonicalWorkspace('/Users/example/Repo/'), expectedWorkspace);
   const lineage = getAutoCopySession(dataDir, 'h', 'session-a');
   assert.ok(lineage.lineageId);
   assert.equal(lineage.enabled, true);
@@ -98,13 +131,145 @@ test('deleting the last lineage member removes mappings, while other members ret
   assert.equal(getAutoCopyMapping(dataDir, lineageId, 's'), null);
 });
 
+test('delete expansion covers every physical copy of one lineage across accounts', () => {
+  const dataDir = tempDataDir();
+  setAutoCopyRule(dataDir, { uid: 'bala', kind: 'session', key: 'sess-bala', enabled: true });
+  const lineageId = getAutoCopySession(dataDir, 'bala', 'sess-bala').lineageId;
+  addAutoCopySessionMember(dataDir, lineageId, 'h', 'sess-h');
+  addAutoCopySessionMember(dataDir, lineageId, 'x', 'sess-x');
+  // 另一个独立 lineage，删除请求不涉及，必须原样保留
+  setAutoCopyRule(dataDir, { uid: 'h', kind: 'session', key: 'keep-h', enabled: true });
+
+  assert.deepEqual(
+    collectLineageMembersForDelete(dataDir, ['sess-bala']),
+    [
+      { uid: 'bala', id: 'sess-bala', lineageId },
+      { uid: 'h', id: 'sess-h', lineageId },
+      { uid: 'x', id: 'sess-x', lineageId },
+    ]
+  );
+  // 只按会话 id 命中 lineage，与传入账号无关；孤儿 id 映射回自身（uid 为空）
+  assert.deepEqual(collectLineageMembersForDelete(dataDir, ['sess-h']).map((m) => m.id), ['sess-bala', 'sess-h', 'sess-x']);
+  assert.deepEqual(collectLineageMembersForDelete(dataDir, ['keep-h']).map((m) => m.id), ['keep-h']);
+  assert.deepEqual(collectLineageMembersForDelete(dataDir, ['nope', 'sess-bala', 'sess-bala']).map((m) => m.id),
+    ['nope', 'sess-bala', 'sess-h', 'sess-x']);
+  assert.deepEqual(collectLineageMembersForDelete(dataDir, []), []);
+});
+
+test('delete expansion dedupes repeated members and survives dirty indices', () => {
+  const dataDir = tempDataDir();
+  setAutoCopyRule(dataDir, { uid: 'bala', kind: 'session', key: 'sess-bala', enabled: true });
+  const lineageId = getAutoCopySession(dataDir, 'bala', 'sess-bala').lineageId;
+  addAutoCopySessionMember(dataDir, lineageId, 'h', 'sess-h');
+  addAutoCopySessionMember(dataDir, lineageId, 'h', 'sess-h');
+  const meta = JSON.parse(fs.readFileSync(metaFile(dataDir), 'utf8'));
+  // 脏索引：lineage 已删但 sessionIndex 残留，或 lineage 引用缺失成员 —— 只影响被收集成员集合
+  delete meta.autoCopy.sessions[lineageId];
+  fs.writeFileSync(metaFile(dataDir), JSON.stringify(meta, null, 2), { mode: 0o600 });
+
+  const members = collectLineageMembersForDelete(dataDir, ['sess-bala', 'sess-bala']);
+  assert.deepEqual(members.map((m) => m.id), ['sess-bala']);
+  assert.equal(members[0].uid, '');
+});
+
+test('lineage member lookup is deduplicated and one member can be removed without deleting the lineage', () => {
+  const dataDir = tempDataDir();
+  setAutoCopyRule(dataDir, { uid: 'source', kind: 'session', key: 'source-session', enabled: true });
+  const lineageId = getAutoCopySession(dataDir, 'source', 'source-session').lineageId;
+  addAutoCopySessionMember(dataDir, lineageId, 'target', 'target-old');
+  addAutoCopySessionMember(dataDir, lineageId, 'target', 'target-old');
+  addAutoCopySessionMember(dataDir, lineageId, 'target', 'target-new');
+  assert.deepEqual(getAutoCopySessionMembers(dataDir, lineageId, 'target'), ['target-old', 'target-new']);
+  assert.equal(removeAutoCopySessionMember(dataDir, lineageId, 'target', 'target-old'), true);
+  assert.deepEqual(getAutoCopySessionMembers(dataDir, lineageId, 'target'), ['target-new']);
+  assert.equal(getAutoCopySession(dataDir, 'source', 'source-session').lineageId, lineageId);
+  assert.deepEqual(getAutoCopySessionMemberRecords(dataDir, lineageId), [
+    { uid: 'source', id: 'source-session' },
+    { uid: 'target', id: 'target-new' },
+  ]);
+});
+
 test('workspace rules are global across source accounts', () => {
   const dataDir = tempDataDir();
+  const expectedWorkspace = '/Users/h/Repo';
   setAutoCopyRule(dataDir, { uid: 'h', kind: 'workspace', key: '/Users/h/Repo/', enabled: true });
-  assert.deepEqual(getAutoCopyRules(dataDir, 'h').workspaces, ['/Users/h/Repo']);
-  assert.deepEqual(getAutoCopyRules(dataDir, 's').workspaces, ['/Users/h/Repo']);
+  assert.deepEqual(getAutoCopyRules(dataDir, 'h').workspaces, [expectedWorkspace]);
+  assert.deepEqual(getAutoCopyRules(dataDir, 's').workspaces, [expectedWorkspace]);
   setAutoCopyRule(dataDir, { uid: 's', kind: 'workspace', key: '/Users/h/Repo', enabled: false });
   assert.deepEqual(getAutoCopyRules(dataDir, 'h').workspaces, []);
+});
+
+test('copy-all defaults off and never rewrites existing per-session rules', () => {
+  const dataDir = tempDataDir();
+  setAutoCopyRule(dataDir, { uid: 'source', kind: 'session', key: 'marked-session', enabled: true });
+
+  assert.equal(getAutoCopyRules(dataDir, 'source').allSessions, false);
+  assert.equal(setAutoCopyAllSessions(dataDir, true).allSessions, true);
+  assert.deepEqual(getAutoCopyRules(dataDir, 'source').sessionIds, ['marked-session']);
+
+  const hiddenLineageId = ensureAutoCopySession(dataDir, 'source', 'unmarked-session', { enabled: false });
+  assert.ok(hiddenLineageId);
+  assert.deepEqual(getAutoCopyRules(dataDir, 'source').sessionIds, ['marked-session']);
+
+  assert.equal(setAutoCopyAllSessions(dataDir, false).allSessions, false);
+  assert.deepEqual(getAutoCopyRules(dataDir, 'source').sessionIds, ['marked-session']);
+});
+
+test('copy-all selects newly created unmarked sessions only while the override is enabled', () => {
+  const markedRules = {
+    allSessions: false,
+    sessionIds: ['marked-session'],
+    workspaces: ['/Users/h/Marked'],
+  };
+  const newSession = { id: 'new-session', cwd: '/Users/h/New' };
+
+  assert.equal(isAutoCopySessionSelected(markedRules, newSession), false);
+  assert.equal(isAutoCopySessionSelected({ ...markedRules, allSessions: true }, newSession), true);
+  assert.equal(isAutoCopySessionSelected(markedRules, { id: 'marked-session', cwd: '/Users/h/New' }), true);
+  assert.equal(isAutoCopySessionSelected(markedRules, { id: 'other-session', cwd: '/Users/h/Marked/' }), true);
+});
+
+test('copy-all can prepare hidden lineages for a session batch without enabling row markers', () => {
+  const dataDir = tempDataDir();
+  const lineages = ensureAutoCopySessions(dataDir, 'source', ['new-a', 'new-b', 'new-a'], { enabled: false });
+
+  assert.deepEqual(Object.keys(lineages).sort(), ['new-a', 'new-b']);
+  assert.notEqual(lineages['new-a'], lineages['new-b']);
+  assert.deepEqual(getAutoCopyRules(dataDir, 'source').sessionIds, []);
+});
+
+test('duplicate session rows sharing one lineage collapse per account without deleting rows', () => {
+  const rows = [
+    { id: 's-new', user_id: 'account-s' },
+    { id: 's-old', user_id: 'account-s' },
+    { id: 'a-copy', user_id: 'account-a' },
+    { id: 'unmarked', user_id: 'account-s' },
+  ];
+  const lineagesByUid = {
+    'account-s': { 's-new': 'lineage-1', 's-old': 'lineage-1' },
+    'account-a': { 'a-copy': 'lineage-1' },
+  };
+  assert.deepEqual(dedupeAutoCopySessionRows(rows, lineagesByUid), [
+    { id: 's-new', user_id: 'account-s' },
+    { id: 'a-copy', user_id: 'account-a' },
+    { id: 'unmarked', user_id: 'account-s' },
+  ]);
+});
+
+test('normalizing lineages separates duplicate physical sessions without deleting them', () => {
+  const dataDir = tempDataDir();
+  const lineageId = ensureAutoCopySession(dataDir, 'source', 'source-session');
+  addAutoCopySessionMember(dataDir, lineageId, 'target', 'target-old');
+  addAutoCopySessionMember(dataDir, lineageId, 'target', 'target-new');
+
+  assert.equal(normalizeAutoCopyLineages(dataDir), true);
+  const meta = JSON.parse(fs.readFileSync(metaFile(dataDir), 'utf8'));
+  const targetLineages = Object.keys(meta.autoCopy.sessions).filter((id) =>
+    (meta.autoCopy.sessions[id].members || []).some((member) => member.uid === 'target'));
+  assert.equal(targetLineages.length, 2);
+  assert.deepEqual(targetLineages.map((id) =>
+    meta.autoCopy.sessions[id].members.filter((member) => member.uid === 'target').length), [1, 1]);
+  assert.notEqual(meta.autoCopy.sessionIndex.target['target-old'], meta.autoCopy.sessionIndex.target['target-new']);
 });
 
 test('long account chains reuse one lineage and clean up without duplicate members', () => {
@@ -153,14 +318,43 @@ test('model backups preserve full local config while enabling one id removes off
   const copied = copyModelBackup(dataDir, backup.backupId);
   assert.notEqual(copied.backupId, backup.backupId);
   assert.equal(copied.apiKey, '••••••');
-  const edited = editModelBackup(dataDir, copied.backupId, { name: 'Edited label', url: 'https://edited.invalid', apiKey: 'secret-edited' });
-  assert.equal(edited.name, 'Edited label');
+  const edited = editModelBackup(dataDir, copied.backupId, { id: 'deepseek-v4-flash', name: '我的 DeepSeek', url: 'https://edited.invalid', apiKey: 'secret-edited' });
+  assert.equal(edited.id, 'deepseek-v4-flash');
+  assert.equal(edited.name, '我的 DeepSeek');
+  const editedRecord = JSON.parse(fs.readFileSync(path.join(dataDir, 'models', copied.backupId + '.json'), 'utf8'));
+  assert.equal(editedRecord.model.id, 'deepseek-v4-flash');
+  assert.equal(editedRecord.model.name, '我的 DeepSeek');
   assert.equal(edited.url, 'https://edited.invalid');
+  const nameOnlyGroup = listModelBackups(dataDir).find((group) => group.id === 'deepseek-v4-flash');
+  assert.equal(nameOnlyGroup.id, 'deepseek-v4-flash');
+  assert.equal(nameOnlyGroup.items[0].name, '我的 DeepSeek');
+  assert.equal(Object.prototype.hasOwnProperty.call(nameOnlyGroup.items[0], '_groupId'), false);
   assert.equal(edited.apiKey, 'sec••••••ited');
-  assert.equal(listModelBackups(dataDir).find((group) => group.id === 'same-id').items.length, 2);
+  const otherBackup = backupOfficialModel(dataDir, 1, modelsFile);
+  editModelBackup(dataDir, otherBackup.backupId, { id: 'deepseek-v4-flash' });
+  const editedGroup = listModelBackups(dataDir).find((group) => group.id === 'deepseek-v4-flash');
+  assert.equal(editedGroup.items.length, 2);
+  assert.equal(listModelBackups(dataDir).find((group) => group.id === 'same-id').items.length, 1);
+  assert.equal(editedGroup.name, undefined);
 
-  assert.equal(deleteModelBackups(dataDir, [backup.backupId, copied.backupId]), 2);
+  assert.equal(deleteModelBackups(dataDir, [backup.backupId, copied.backupId, otherBackup.backupId]), 3);
   assert.equal(listModelBackups(dataDir).length, 0);
+});
+
+test('same model id with different custom names stays in one id-named group', () => {
+  const dataDir = tempDataDir();
+  const modelsFile = path.join(dataDir, 'models.json');
+  fs.writeFileSync(modelsFile, JSON.stringify([
+    { id: 'deepseek-v4-flash', name: 'deepseek-v4-flash2 aaa' },
+    { id: 'deepseek-v4-flash', name: 'deepseek-v4-flash2 bbb' },
+  ]));
+  backupOfficialModel(dataDir, 0, modelsFile);
+  backupOfficialModel(dataDir, 1, modelsFile);
+  const groups = listModelBackups(dataDir);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].id, 'deepseek-v4-flash');
+  assert.equal(groups[0].items.length, 2);
+  assert.deepEqual(groups[0].items.map((item) => item.name).sort(), ['deepseek-v4-flash2 aaa', 'deepseek-v4-flash2 bbb']);
 });
 
 test('official model batch deletion only changes official config and leaves backups intact', () => {
@@ -210,11 +404,12 @@ test('api keys keep their full masked length without exposing the middle', () =>
   assert.equal(masked.includes('abcdef'), false);
 });
 
-test('checkin display hides cached result while the current claim is still running', () => {
+test('checkin display exposes only today’s confirmed result', () => {
   const record = { date: '2026-08-23', ok: true, already: false, code: 0, message: 'ok' };
-  assert.equal(checkinDisplayValue(record, '2026-08-23', true), null);
-  assert.deepEqual(checkinDisplayValue(record, '2026-08-23', false), {
+  assert.deepEqual(checkinDisplayValue(record, '2026-08-23'), {
     ok: true, already: false, code: 0, message: 'ok',
   });
-  assert.equal(checkinDisplayValue(record, '2026-08-22', false), null);
+  assert.equal(checkinDisplayValue({ date: '2026-08-23', ok: false }, '2026-08-23'), null);
+  assert.equal(checkinDisplayValue(null, '2026-08-23'), null);
+  assert.equal(checkinDisplayValue(record, '2026-08-24'), null);
 });
