@@ -203,7 +203,17 @@ This project is licensed under the **[GNU Affero General Public License v3.0](LI
 - Third-party themes, wallpapers, and background images are provided for demonstration; check their rights before commercial use.
 
 ---
+## Star History
 
+<a href="https://www.star-history.com/?repos=babygoton%2Fworkdaddy&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=babygoton/workdaddy&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=babygoton/workdaddy&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=babygoton/workdaddy&type=date&legend=top-left" />
+ </picture>
+</a>
+
+---
 ## Community
 
 [Linux.do](https://linux.do/)
