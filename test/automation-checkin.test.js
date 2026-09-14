@@ -90,8 +90,8 @@ test('legacy implicit triggers and pending UI are removed; panel event is explic
   assert.match(ui,/\/api\/automations\/events/);
   const html=ui.slice(ui.indexOf('function checkinHtml'),ui.indexOf('function el(tag'));
   const ctx={WBS_PROFILE_IS_AI:false};vm.createContext(ctx);vm.runInContext(html,ctx);
-  assert.match(ctx.checkinHtml({}),/pending.*今日签到/);
-  assert.match(ctx.checkinHtml({checkin:{ok:true}}),/tag ok.*今日签到/);
+  assert.match(ctx.checkinHtml({}),/pending.*今日未签到/);
+  assert.match(ctx.checkinHtml({checkin:{ok:true}}),/tag ok.*今日已签到/);
   assert.doesNotMatch(ctx.checkinHtml({checkin:{ok:false,message:'bad'}}),/bad/);
 });
 
@@ -135,7 +135,7 @@ test('fresh CN and AI profiles receive all three presets without reinstalling de
   for (const id of ['workbuddy-cn', 'workbuddy-ai']) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-presets-'));
     try {
-      const context = { PROFILE: PROFILES[id], DATA_DIR: dir, path, __dirname: path.join(__dirname, '../scripts'), installBuiltinTask: automation.installBuiltinTask, log() {} };
+      const context = { initializeCheckinConsent: require('../scripts/checkin-consent').initializeCheckinConsent, PROFILE: PROFILES[id], DATA_DIR: dir, path, __dirname: path.join(__dirname, '../scripts'), installBuiltinTask: automation.installBuiltinTask, log() {} };
       vm.runInNewContext(init, context);
       assert.deepEqual(automation.readAutomations(dir).map(t => t.id).sort(), ['buddy-fuel-station-close-on-account-switch', 'daily-account-checkin', 'keep-accounts-active-1-plus-1']);
       automation.writeAutomations(dir, []);
