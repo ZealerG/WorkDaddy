@@ -73,6 +73,36 @@ test('Windows watchdog uses an OS-managed profile lock and keeps restart backoff
   assert.doesNotMatch(watchdog, /pending\.json|updateProcessIsActive|powershell|Get-CimInstance|taskkill/i);
 });
 
+test('every Windows batch file under scripts/ keeps CRLF line endings', () => {
+  // .gitattributes declares `*.cmd -text`, so git performs no line-ending
+  // conversion: whatever the blob holds is what cmd.exe receives. An LF-only
+  // batch file makes cmd.exe mis-parse parenthesised blocks, which is exactly
+  // what the Windows release workflow fails closed on (the 校验 CRLF step).
+  // Some upstream files mix endings but still carry CRLF, so the enforced rule
+  // is "not LF-only" rather than "no bare LF anywhere".
+  const scriptsDir = path.join(__dirname, '..', 'scripts');
+  const skipDirs = new Set(['node_modules', 'runtime']);
+  const batches = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!skipDirs.has(entry.name)) walk(full);
+      } else if (/\.cmd$/i.test(entry.name)) {
+        batches.push(full);
+      }
+    }
+  };
+  walk(scriptsDir);
+  assert.ok(batches.length > 0, 'expected at least one Windows batch file under scripts/');
+  for (const file of batches) {
+    const rel = path.relative(path.join(__dirname, '..'), file);
+    const text = fs.readFileSync(file).toString('latin1');
+    const bare = text.replace(/\r\n/g, '').split('\n').length - 1;
+    assert.ok(text.includes('\r\n'), `${rel} is LF-only (${bare} bare LF); cmd.exe needs CRLF`);
+  }
+});
+
 test('Windows installer excludes the repair prompt from all release stages', () => {
   const zipBuild = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-win-zip.sh'), 'utf8');
   const installerBuild = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-win-installer.ps1'), 'utf8');
