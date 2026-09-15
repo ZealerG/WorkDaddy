@@ -2,7 +2,7 @@
  * 右下角悬浮组件（注入到 WorkBuddy 渲染进程，由 daemon.js 通过 CDP 注入执行）
  *
  * 功能：
- *  1. 右下角圆形黑色悬浮按钮（hover 展开为胶囊显示"WorkDaddy"）
+ *  1. 右下角官网同款机器人按钮，支持拖动与自动停靠
  *  2. 点击按钮弹出账号面板（白色主题）：面板右下角与按钮右下角重叠；面板打开时按钮隐藏，关闭后恢复
  *  3. 账号列表展示 昵称 / 手机（明文） / Token 过期时间（<7 天红字）；不展示 uid/uin/上次登录
  *  4. 每账号右侧为「发起会话」「切换」「删除」纯图标按钮；发起会话使用备份 token，不切换当前账号
@@ -13,6 +13,36 @@
  * 与后端通信：fetch 本地 daemon（__WBS_API__ 占位符在注入时替换为实际地址）
  * 幂等：window.__wbsWidget 防重复注入；document.body 未就绪时等待 DOMContentLoaded。
  */
+// Activity signals contain no key, text, target or pointer coordinates.
+function createUsageActivity(options) {
+  var doc = options.document, win = options.window;
+  var alive = true, last = null, lastDay = '';
+  function notify(event) {
+    if (!alive || doc.visibilityState !== 'visible' || !doc.hasFocus()) return;
+    if (event && event.isTrusted !== true) return;
+    var time = options.now();
+    var day = new Date(time + 8 * 3600000).toISOString().slice(0, 10);
+    if (last !== null && lastDay === day && time - last < 3600000) return;
+    last = time; lastDay = day;
+    try { Promise.resolve(options.send()).catch(function () {}); } catch (_) {}
+  }
+  doc.addEventListener('pointerdown', notify, true);
+  doc.addEventListener('keydown', notify, true);
+  doc.addEventListener('visibilitychange', notify, true);
+  win.addEventListener('focus', notify, true);
+  notify();
+  return {
+    notify: notify,
+    destroy: function () {
+      alive = false;
+      doc.removeEventListener('pointerdown', notify, true);
+      doc.removeEventListener('keydown', notify, true);
+      doc.removeEventListener('visibilitychange', notify, true);
+      win.removeEventListener('focus', notify, true);
+    },
+  };
+}
+
 function createBuildLifecycle() {
   var active = true;
   var disposers = [];
@@ -41,6 +71,51 @@ function createBuildLifecycle() {
     registerDisposer: registerDisposer,
     destroy: destroy,
     alive: function () { return active; },
+  };
+}
+
+// 单击与五连击共享一个等待窗口，避免打开官网打断调试手势。
+function createBrandClickAction(options) {
+  var count = 0, timer = null, alive = true;
+  return {
+    click: function () {
+      if (!alive) return;
+      count++;
+      if (timer !== null) options.clearTimeout(timer);
+      timer = options.setTimeout(function () {
+        timer = null;
+        var open = count > 0 && count < 5;
+        count = 0;
+        if (alive && open) options.openWebsite();
+      }, 1200);
+      if (count === 5) options.unlockDebug();
+    },
+    destroy: function () {
+      alive = false;
+      if (timer !== null) options.clearTimeout(timer);
+      timer = null;
+      count = 0;
+    },
+  };
+}
+
+function createFabAppearance(options) {
+  var styles = ['white', 'black', 'glass'];
+  var current = 'black';
+  try {
+    var saved = options.storage.getItem(options.key);
+    if (styles.indexOf(saved) >= 0) current = saved;
+  } catch (_) {}
+  function apply() { options.fab.setAttribute('data-wbs-robot-style', current); }
+  apply();
+  return {
+    get: function () { return current; },
+    set: function (value) {
+      if (styles.indexOf(value) < 0) return;
+      current = value;
+      try { options.storage.setItem(options.key, current); } catch (_) {}
+      apply();
+    },
   };
 }
 
@@ -371,19 +446,43 @@ function stashContentMatches(expected, current) {
   return !!expected && !!current && stashContentSignature(expected) === stashContentSignature(current);
 }
 
+/* ── 确认类弹窗的「允许」文案表（唯一事实来源，扫描与测试共用）──
+ *
+ * 精确匹配，不做模糊包含：泛化的「确认」「确定」永远不得命中（扣费/提权弹窗只有这类按钮）。
+ *
+ * 收录范围（按官方源码/文案核对）：
+ *   · sandbox.interceptAllowOnce            「允许」          沙箱越权拦截卡（含 .sensitive 变体）
+ *   · sensitiveProtection.allowAccess       「允许访问」      敏感凭证拦截卡 ingress 的 allow_once
+ *   · sensitiveProtection.allowEncryptedAccess 「允许加密访问（推荐）」 ingress-protectable / protect-only 选项
+ *   · sensitiveProtection.allowAndProtect   「允许，并加密保护」
+ *
+ * 故意不收录（自动放行会造成真实损失或提权，必须留人工把关）：
+ *   · sensitiveProtection.allowSend 「允许发送」  凭证外发（egress）→ 自动点等于静默外泄；
+ *   · 批量删除的「允许本次删除」      交给「大批量删除免确认」开关单独控制；
+ *   · 「确认开启」                  开启「允许完全访问」的授权确认，属提权，必须人来点；
+ *   · teamMember 的「本次允许」       其他成员请求执行工具，不是本机自动化的目标。
+ */
+var ND_ALLOW_ONCE_LABELS = /^(允许|允许一次|允许访问|允许，并加密保护|允许加密访问（推荐）|允许加密访问|Allow|Allow once|Allow access|Allow and encrypt|Allow encrypted access( \(Recommended\))?|Yes|同意|批准|确认允许)$/i;
+var ND_ALLOW_SESSION_LABELS = /始终允许|Always\s*allow/i;
+// 决策组按钮数量上限，也是「还在卡片内」的判据：超过即视为已上溯到会话/页面容器，停止。
+var ND_MAX_DECISION_BUTTONS = 12;
+var ND_DENY_HINTS = /拒绝|禁止|取消删除|Deny/i;
+var ND_CREDIT_HINTS = /积分|信用|credit|消耗|付费|支付|费用|金额|余额|扣费/i;
+var ND_CONFIRM_HINTS = /批量删除|沙箱|越界|越权|系统级工具|系统工具|权限|允许访问|允许加密访问|将运行|需要你确认|需要你的确认|确认允许|检测到|受保护|敏感|凭据|凭证|黑名单|sandbox|approval|permission/i;
+
 // Pure approval-label/context gate shared by the renderer fallback and tests.
 // Keep this deliberately narrow: a generic "确认" button must never qualify.
 function classifyNoDisturbApprovalCandidate(input) {
   var value = input || {};
   var label = String(value.label || '').trim().replace(/^\d+\s*/, '');
   var kind = null;
-  if (/始终允许|Always\s*allow/i.test(label)) kind = 'session';
-  else if (/^(允许|允许一次|Allow|Yes|同意|批准|确认允许)$/i.test(label) || (/^Yes/i.test(label) && label.length < 24)) kind = 'once';
+  if (ND_ALLOW_SESSION_LABELS.test(label)) kind = 'session';
+  else if (ND_ALLOW_ONCE_LABELS.test(label) || (/^Yes/i.test(label) && label.length < 24)) kind = 'once';
   if (!kind || value.disabled || value.ariaDisabled) return null;
   var context = String(value.context || '').slice(0, 700);
-  if (value.creditSeen || /积分|信用|credit|消耗|付费|支付|费用|金额|余额|扣费/i.test(context)) return null;
-  var keywordHit = /批量删除|沙箱|越界|越权|系统级工具|系统工具|权限|允许访问|将运行|需要你确认|需要你的确认|确认允许|检测到|受保护|敏感|凭据|黑名单|sandbox|approval|permission/i.test(context);
-  var structuredHit = value.hasDeny === true && value.hasOnce === true && Number(value.buttonCount || 0) >= 2 && Number(value.buttonCount || 0) <= 12;
+  if (value.creditSeen || ND_CREDIT_HINTS.test(context)) return null;
+  var keywordHit = ND_CONFIRM_HINTS.test(context);
+  var structuredHit = value.hasDeny === true && value.hasOnce === true && Number(value.buttonCount || 0) >= 2 && Number(value.buttonCount || 0) <= ND_MAX_DECISION_BUTTONS;
   return keywordHit || structuredHit ? kind : null;
 }
 
@@ -554,7 +653,10 @@ function createSessionMonitorRegistry(options) {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    createUsageActivity: createUsageActivity,
     createBuildLifecycle: createBuildLifecycle,
+    createBrandClickAction: createBrandClickAction,
+    createFabAppearance: createFabAppearance,
     classifySessionHealth: classifySessionHealth,
     classifyAutoContinueReply: classifyAutoContinueReply,
     classifyAutoContinueControllerSnapshot: classifyAutoContinueControllerSnapshot,
@@ -569,6 +671,10 @@ if (typeof module !== 'undefined' && module.exports) {
     stashContentSignature: stashContentSignature,
     stashContentMatches: stashContentMatches,
     classifyNoDisturbApprovalCandidate: classifyNoDisturbApprovalCandidate,
+    ndAllowOnceLabels: ND_ALLOW_ONCE_LABELS,
+    ndAllowSessionLabels: ND_ALLOW_SESSION_LABELS,
+    ndConfirmHints: ND_CONFIRM_HINTS,
+    ndDenyHints: ND_DENY_HINTS,
     isSessionMonitorInProgress: isSessionMonitorInProgress,
     normalizeSessionMonitorResourceRecord: normalizeSessionMonitorResourceRecord,
     sessionMonitorLifecycleAction: sessionMonitorLifecycleAction,
@@ -584,6 +690,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   (function () {
     var n;
     if ((n = document.querySelector('.wbs-root'))) n.remove();
+    if ((n = document.getElementById('wbs-window-logo'))) n.remove();
     var st = document.querySelectorAll('.wbs-stash-inline, .wbs-stash-btn, .wbs-explore-inline, .wbs-selection-quote-btn');
     for (var i = 0; i < st.length; i++) st[i].remove();
     var nav = document.querySelectorAll('.wbs-message-nav-root');
@@ -615,6 +722,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   var WBS_API_TOKEN = '__WBS_API_TOKEN__';
   var WBS_DIAGNOSTICS_ENABLED = __WBS_DIAGNOSTICS_ENABLED__;
   var WBS_PLATFORM = __WBS_PLATFORM__; // 注入时替换为 JSON 字符串（如 "darwin"/"win32"）
+  var WBS_LOGO = '__WBS_LOGO__';
+  var WBS_AVATAR_LOGO = '__WBS_AVATAR_LOGO__';
   var WBS_COMPAT = window.__wbsWorkBuddyCompat;
   if (!WBS_COMPAT) throw new Error('WorkBuddy 兼容层未加载');
   // WorkBuddy 基于 Electron，持续会话模块在 macOS/Windows 使用同一套 CDP 逻辑。
@@ -628,6 +737,69 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   var WBS_LANGUAGE_KEY = 'workdaddy.ui.language';
   var WBS_ACCOUNT_MASK_KEY = 'workdaddy.account.mask.' + PROFILE_ID;
   var WBS_I18N_EN = {
+    '自动签到提醒': 'Automatic check-in',
+    '开启后自动为已保存账号签到。': 'Enable automatic check-in for your saved accounts.',
+    '请留意官方规则，自动操作可能影响账号使用。': 'Please follow the official rules; automated actions may affect your account access.',
+    '可随时在「自动化」中关闭。': 'You can turn this off at any time under Automations.',
+    '开启自动签到': 'Enable automatic check-in',
+    '保存失败，请重试。': 'Could not save. Please try again.',
+
+    '查询失败，请重新选择时间或账号重试': 'Query failed. Select a time range or account to retry.',
+    '查询已中断，请重新选择时间或账号重试': 'Query interrupted. Select a time range or account to retry.',
+    '无法读取查询进度，请重新选择时间或账号重试': 'Could not read progress. Select a time range or account to retry.',
+    '积分（部分日期加载中）': 'credits (some dates are loading)',
+    '日期数据加载中': 'Loading date records',
+
+    '直接查询官方积分用量': 'Live credit usage from the official service',
+    '重新查询最新积分用量': 'Refresh credit usage from the official service',
+    '正在查询积分用量…': 'Querying credit usage…',
+    '积分查询进度': 'Credit query progress',
+    '积分消耗': 'Credits used',
+    '积分（部分账号查询失败）': 'credits (some accounts failed)',
+    '查询失败，暂无数据': 'Query failed; no data',
+    '查询失败，请点击刷新重试': 'Query failed. Click Refresh to retry.',
+    '已查询': 'Queried ',
+    '查询成功': 'Query succeeded for ',
+    ' 个账号；结果不完整。': ' accounts; results are incomplete.',
+    '查询时间：': 'Queried at: ',
+    '查询已中断，请点击刷新重试': 'Query interrupted. Click Refresh to retry.',
+    '无法读取查询进度，请点击刷新重试': 'Could not read query progress. Click Refresh to retry.',
+    '另一个积分查询正在进行，请稍后重试': 'Another credit query is running. Please retry shortly.',
+    '记录未完整获取，请稍后重试': 'Could not retrieve all records. Please retry later.',
+    '* 表示部分账号查询失败；— 表示查询失败，暂无数据。': '* Some accounts failed; — query failed, no data.',
+    '查询参数无效，请选择近 7、30 或 90 天': 'Invalid range. Select the last 7, 30 or 90 days.',
+
+    '用量统计': 'Usage statistics',
+    '更新历史积分记录': 'Update credit history',
+    '正在更新历史积分记录': 'Updating credit history',
+    '先显示已保存的记录；更新历史可补齐其他设备的使用记录。账号和记录越多，等待越久，可能需要数分钟。': 'Saved records appear first. Update history to include usage from other devices. More accounts and records take longer; this may take several minutes.',
+    '账号和记录越多，等待越久，可能需要数分钟。关闭窗口后仍会在后台继续。': 'More accounts and records take longer; this may take several minutes. Updating continues in the background if you close this window.',
+    '正在连接…': 'Connecting…',
+    '后台继续': 'Continue in background',
+    '更新范围：近': 'Update range: last ',
+    '已记录积分消耗': 'Recorded credits used',
+    '筛选账号数': 'Selected accounts',
+    '积分（记录待补齐）': 'credits (incomplete history)',
+    '尚无记录，请更新历史': 'No records yet; update history',
+    '* 表示部分账号查询失败；— 表示查询失败，暂无数据。': '* Incomplete history; — no records, which does not mean zero usage. Today reflects the last update.',
+    '账号用量': 'Usage by account',
+    '没有匹配的账号': 'No matching accounts',
+    '读取失败，请切换时间范围后重试': 'Could not load records. Change the date range to retry.',
+    '已处理': 'Processed ',
+    ' · 第': ' · Page ',
+    ' 页 · 已读取': ' · Read ',
+    ' 条记录': ' records',
+    '更新完成：成功': 'Update complete: succeeded ',
+    ' 个，可重试。': ' accounts; you can retry.',
+    '进度连接暂时中断，正在重试…': 'Progress connection interrupted. Reconnecting…',
+    '更新请求未确认，正在检查后台进度…': 'Update request unconfirmed. Checking background progress…',
+    '搜索账号名称或 ID': 'Search account name or ID',
+    '积分记录更新进度': 'Credit history update progress',
+    '登录身份过期或不可用，请重新登录后重试': 'Login expired or unavailable. Sign in again to retry.',
+    '请求超时，请稍后重试': 'Request timed out. Try again later.',
+    '记录未完整获取或保存，请稍后重试': 'Could not retrieve or save complete records. Try again later.',
+    '后台更新已中断，请重新更新历史记录。': 'Background update interrupted. Please update history again.',
+
     '等待发送按钮可点击超时（5 秒），未发送': 'The send button was not ready within 5 seconds. Nothing was sent.',
     '无法关闭面板，请重试': 'Could not close the panel. Please try again.',
     '正在输入或切换账号，请稍后打开面板': 'Typing or switching accounts. Please open the panel in a moment.',
@@ -636,6 +808,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     "依次切换所有账号，等待当前会话输入框出现后发送 1+1=，等待回复完成，最后恢复开始时的账号。": "Switch through all accounts, wait for the composer, send 1+1=, wait for each reply to finish, then restore the starting account.",
     "页面就绪后自动关闭首页弹窗": "Close home popups when the page is ready",
     "页面就绪后立即检查三类弹窗，每 300 毫秒补查，持续约 30 秒；重新出现的弹窗继续关闭，快速切换账号时重新检测新页面。": "Check for three types of home popups every 300 ms for about 30 seconds. Close any that reappear and restart detection after account switches.",
+    "页面就绪后立即检查首页弹窗与运营位，每 300 毫秒补查，持续约 30 秒；重新出现的弹窗继续关闭，快速切换账号时重新检测新页面。": "Check home popups and promotional slots every 300 ms for about 30 seconds. Close any that reappear and restart detection after account switches.",
     "循环账号静默签到": "Check in all accounts in the background",
     "使用各账号 token 签到，不切换当前账号；跳过今日已签到账号。每小时、客户端加载和打开面板时检查。": "Check in with each account without switching the active account. Skip accounts already checked in today. Check hourly, on client load, and when the panel opens.",
     "所有账号已按序处理完毕，已恢复开始时的账号": "All accounts have been processed. The starting account has been restored.",
@@ -643,11 +816,13 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     "该账号签到未成功，请检查登录状态或签到活动": "Check-in failed for this account. Check its login status and check-in availability.",
     "识别到 Buddy 加油站弹窗，已关闭": "Buddy Fuel Station popup detected and closed.",
     "已关闭相关玩法推荐，今日不再展示": "Related playbook recommendations dismissed for today.",
+    "已关闭「做任务赢积分好礼」入口": "Tasks-for-credits promotion closed.",
     "已关闭首页活动弹窗": "Home activity popup closed.",
+    "Token 用量仅统计本机记录，在不同电脑上查看的数据可能不一致。": "Token usage only includes records on this computer. Figures may differ between computers.",
     "会话输入框非空，未覆盖草稿、未发送": "The composer contains a draft. Nothing was overwritten or sent.",
     '页面就绪': 'Page ready', '删除选中的': 'Delete selected', '删除该自动化任务？': 'Delete this automation task?', '删除选中的自动化任务？': 'Delete selected automation tasks?', '删除后无法恢复。': 'This cannot be undone.', '清除': 'Clear', '清除日志': 'Clear logs', '清除运行日志？': 'Clear run logs?', '仅清除已结束的运行记录。': 'Only completed run records will be cleared.', '清除日志失败': 'Failed to clear logs', '任务已启用': 'Task enabled', '任务已停用': 'Task disabled', '发送中': 'Sending',
     '账号': 'Accounts', '主题': 'Theme', '会话': 'Sessions', '模型': 'Models', '增强': 'Enhance', '自动化': 'Automation', '电脑': 'Computer', '关于': 'About', '设置': 'Settings',
-    '导出': 'Export', '导入': 'Import', '删除': 'Delete', '编辑': 'Edit', '保存': 'Save', '取消': 'Cancel', '确定': 'Confirm', '确认': 'Confirm', '复制': 'Copy', '切换': 'Switch', '启用': 'Enable', '停用': 'Disable', '停止': 'Stop', '立即运行': 'Run now', '新建任务': 'New task', '刷新': 'Refresh', '步骤 JSON': 'Steps JSON', '任务说明': 'Task description', '任务名称': 'Task name', '调度': 'Schedule', '手动运行': 'Manual', '手动': 'Manual', '每小时': 'Hourly', '每天': 'Daily', '选择任务': 'Select tasks', '查看接口': 'View capabilities', '拾取元素': 'Pick element', '复制 XPath': 'Copy XPath', '运行中': 'Running', '已成功': 'Succeeded', '失败': 'Failed', '未运行': 'Not run', '页面加载完成': 'Page loaded', '账号切换完成': 'Account switched', '新自动化任务': 'New automation task', '任务已保存': 'Task saved', '任务已开始运行': 'Task started', '步骤 JSON 格式无效': 'Invalid steps JSON', '步骤 JSON 必须是数组': 'Steps JSON must be an array', '查看接口说明': 'View interface docs', '自动化接口协议': 'Automation interface protocol', '复制全部': 'Copy all', '接口协议已复制': 'Interface protocol copied', '暂无自动化任务，点击“新建任务”开始。': 'No automation tasks yet. Click “New task” to start.', '编辑任务': 'Edit task', '触发方式': 'Trigger', '插入点击步骤': 'Insert click step', 'XPath 已复制': 'XPath copied', '点击步骤已插入': 'Click step inserted', '请先拾取元素': 'Pick an element first', '加载自动化失败': 'Failed to load automations', '读取接口失败': 'Failed to read interfaces', '批量操作失败': 'Batch operation failed', '删除失败': 'Delete failed', '确认删除该任务？': 'Delete this task?', '执行': 'Apply', '已拾取': 'Picked', '运行失败': 'Run failed', '（副本）': ' (copy)', '查看提示词': 'View prompt', '交给 WorkBuddy 创建': 'Ask WorkBuddy to create', '正在打开新任务…': 'Opening a new task…', '已创建新会话，WorkBuddy 完成后任务会自动出现': 'New session created. The task will appear after WorkBuddy finishes.', 'WorkBuddy 创建失败': 'WorkBuddy creation failed', '加载示例失败': 'Failed to load examples', '暂无示例': 'No examples available', '运行日志': 'Run logs', '暂无运行日志': 'No run logs yet', '开始时间': 'Started', '结束时间': 'Finished', '捕获错误': 'Caught error', '暂无执行日志': 'No execution log entries', '执行日志': 'Execution log', '尚未结束': 'Still running',
+    '导出': 'Export', '导入': 'Import', '删除': 'Delete', '编辑': 'Edit', '保存': 'Save', '内置': 'Built-in', '取消': 'Cancel', '确定': 'Confirm', '确认': 'Confirm', '复制': 'Copy', '切换': 'Switch', '启用': 'Enable', '停用': 'Disable', '停止': 'Stop', '立即运行': 'Run now', '新建任务': 'New task', '刷新': 'Refresh', '步骤 JSON': 'Steps JSON', '任务说明': 'Task description', '任务名称': 'Task name', '调度': 'Schedule', '手动运行': 'Manual', '手动': 'Manual', '每小时': 'Hourly', '每天': 'Daily', '选择任务': 'Select tasks', '查看接口': 'View capabilities', '拾取元素': 'Pick element', '复制 XPath': 'Copy XPath', '运行中': 'Running', '已成功': 'Succeeded', '失败': 'Failed', '未运行': 'Not run', '页面加载完成': 'Page loaded', '账号切换完成': 'Account switched', '新自动化任务': 'New automation task', '任务已保存': 'Task saved', '任务已开始运行': 'Task started', '步骤 JSON 格式无效': 'Invalid steps JSON', '步骤 JSON 必须是数组': 'Steps JSON must be an array', '查看接口说明': 'View interface docs', '自动化接口协议': 'Automation interface protocol', '复制全部': 'Copy all', '接口协议已复制': 'Interface protocol copied', '暂无自动化任务，点击“新建任务”开始。': 'No automation tasks yet. Click “New task” to start.', '编辑任务': 'Edit task', '触发方式': 'Trigger', '插入点击步骤': 'Insert click step', 'XPath 已复制': 'XPath copied', '点击步骤已插入': 'Click step inserted', '请先拾取元素': 'Pick an element first', '加载自动化失败': 'Failed to load automations', '读取接口失败': 'Failed to read interfaces', '批量操作失败': 'Batch operation failed', '删除失败': 'Delete failed', '确认删除该任务？': 'Delete this task?', '执行': 'Apply', '已拾取': 'Picked', '运行失败': 'Run failed', '（副本）': ' (copy)', '查看提示词': 'View prompt', '交给 WorkBuddy 创建': 'Ask WorkBuddy to create', '正在打开新任务…': 'Opening a new task…', '已创建新会话，WorkBuddy 完成后任务会自动出现': 'New session created. The task will appear after WorkBuddy finishes.', 'WorkBuddy 创建失败': 'WorkBuddy creation failed', '加载示例失败': 'Failed to load examples', '暂无示例': 'No examples available', '运行日志': 'Run logs', '暂无运行日志': 'No run logs yet', '开始时间': 'Started', '结束时间': 'Finished', '捕获错误': 'Caught error', '暂无执行日志': 'No execution log entries', '执行日志': 'Execution log', '尚未结束': 'Still running',
     '暂存提示词': 'Stash prompt', '暂存': 'Stashed', '引用文本': 'Quote text', '快捷短语': 'Quick phrases', '点击后发送': 'Send on click', '编辑 →': 'Edit →', '新增': 'Add', '批量操作': 'Batch actions', '批量管理': 'Batch manage', '全选': 'Select all', '取消全选': 'Deselect all', '已选 0': 'Selected 0',
     '账号汇总': 'Account summary', '账号数': 'Accounts', '总积分': 'Total credits', '手机': 'Phone', '有效期至': 'Expires', '当前使用中': 'Currently active', '隐藏敏感信息': 'Mask sensitive info', '显示明文': 'Show plaintext', '登录新账号': 'Log in a new account', '没有可导出的账号备份': 'No account backups to export', '还没有备份账号。打开/登录一次 WorkBuddy 后会自动备份，稍后再来查看。': 'No account backups yet. Open or log in to WorkBuddy once and check again later.',
     '语言': 'Language', '中文': 'Chinese', '英语': 'English', 'English': 'English', '跟随系统': 'Follow system', '设置语言': 'Language', '首次打开时自动跟随系统语言；未匹配时使用英语。': 'The first launch follows your system language. English is used when no match is found.', '语言设置已更新': 'Language updated',
@@ -690,18 +865,18 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     "请选择将来的执行日期和时间": "Choose a future date and time",
     "请选择有效的执行日期和时间": "Choose a valid date and time",
     "每月日期必须是 1–31": "Day of month must be 1\u201331",
-    '今日签到': 'Daily check-in', '今日已签到': 'Checked in today', '今日尚未签到': 'Not checked in today', '客户端加载': 'Client loaded', '打开面板': 'Panel opened', '事件触发（可多选）': 'Event triggers (select any)', '定时间隔（分钟）': 'Interval (minutes)', '定时': 'Scheduled', '每 ': 'Every ', '定时间隔必须是 1–10080 分钟的整数': 'Interval must be an integer from 1 to 10080 minutes', '不支持的面板事件': 'Unsupported panel event', '无签到活动': 'No check-in activity', '登录身份过期': 'Login expired', '刚刚': 'Just now', '分钟前': ' minutes ago', '小时前': ' hours ago', '天前': ' days ago',
+    '产物索引已变化，请重试同步': 'Artifact index changed; retry synchronization', '已到期': 'Expired', ' 个未获取余额': ' balances unavailable', ' 个不限量': ' unlimited', '无效的账号排序设置': 'Invalid account order settings', '产物索引超过 16MB，未覆盖目标索引': 'Artifact index exceeds 16MB; target index was preserved', '产物索引格式不受支持': 'Unsupported artifact index format', '积分汇总': 'Credit summary', '更多账号设置': 'More account settings', '积分到期分布': 'Credit expiry distribution', '剩余天数 · 积分': 'Days left · Credits', '按剩余天数汇总积分': 'Credits by days remaining', '未知有效期': 'Unknown expiry', '暂无可汇总积分': 'No credits to summarize', '拖拽调整顺序，也可聚焦拖拽按钮后按 ↑ ↓ 调整。新增账号排在最后。': 'Drag to reorder, or focus a handle and press ↑ ↓. New accounts appear last.', '拖拽排序，或按上下方向键调整': 'Drag or use arrow keys to reorder', '调整账号顺序': 'Reorder account', '固定账号顺序': 'Fixed account order', '保存排序失败': 'Failed to save order', '暂无账号': 'No accounts', '{n} 个账号': '{n} accounts', '{n} 个未获取余额': '{n} balances unavailable', '{n} 个不限量': '{n} unlimited', '今日未签到': 'Not checked in today', '浅色': 'Light', '深色': 'Dark', '更多': 'More', '汇总': 'Summary', '账号排序': 'Account order', '按积分临近时间': 'Nearest credit expiry', '固定顺序': 'Fixed order', '今日签到': 'Daily check-in', '今日已签到': 'Checked in today', '今日尚未签到': 'Not checked in today', '客户端加载': 'Client loaded', '打开面板': 'Panel opened', '事件触发（可多选）': 'Event triggers (select any)', '定时间隔（分钟）': 'Interval (minutes)', '定时': 'Scheduled', '每 ': 'Every ', '定时间隔必须是 1–10080 分钟的整数': 'Interval must be an integer from 1 to 10080 minutes', '不支持的面板事件': 'Unsupported panel event', '无签到活动': 'No check-in activity', '登录身份过期': 'Login expired', '刚刚': 'Just now', '分钟前': ' minutes ago', '小时前': ' hours ago', '天前': ' days ago',
     '发现新版本': 'New version available', '立即更新': 'Update now', '有新版本可用，点击更新。': 'A new version is available. Click Update.', '下载中…': 'Downloading…', '正在打开…': 'Opening…', '安装程序已打开': 'Installer opened', '打开安装程序': 'Open installer', '安装中…': 'Installing…', '重启中…': 'Restarting…', '已完成': 'Completed', '重试更新': 'Retry update',
     '安全传输': 'Secure transfer', '选择内容': 'Select content', '选择账号': 'Select accounts', '选择目标账号': 'Select target account', '选择目标账号…': 'Select a target account…', '密码': 'Password', '请输入密码': 'Enter password', '密码不能为空': 'Password cannot be empty', '请至少选择一项': 'Select at least one item', '处理中…': 'Processing…', '新版文件请输入密码': 'Enter the password for the new file', '新版文件必须输入密码；旧版导出文件可留空。': 'New files require a password; older exports may be left blank.', '新版文件请输入密码；已有的相同短语会自动跳过。': 'Enter the password for the new file; duplicate phrases are skipped.',
     '电脑休眠': 'Computer sleep', '允许电脑休眠': 'Allow computer sleep', '持续禁止休眠': 'Keep awake', '所有会话结束允许休眠': 'Allow sleep when all sessions end', '系统默认，空闲后正常休眠': 'System default; sleep normally when idle', '保持唤醒，防黑屏锁屏': 'Stay awake to prevent screen lock', '任一会话运行中都保持唤醒': 'Stay awake while any session is running', '允许显示器休眠': 'Allow display sleep', '禁止休眠时，是否允许显示器单独黑屏': 'When sleep is blocked, allow the display to turn off',
-    '发送错误诊断': 'Send error diagnostics', '推荐开启': 'Recommended', '由环境变量控制': 'Controlled by environment variable', '默认开启 · 设置读取失败': 'Enabled by default · failed to read setting', '保存中…': 'Saving…', '仅发送经过脱敏、截断的版本、系统和错误信息，不包含账号、会话内容、Token 或 API Key；可随时关闭。': 'Only redacted and truncated version, system, and error details are sent. Accounts, sessions, tokens, and API keys are excluded; you can turn this off anytime.', '查看错误诊断说明': 'View diagnostics details', '问题反馈': 'Report an issue', '会话监听日志': 'Session monitor log', '仅保存在当前页面内存': 'Stored only in this page memory',
+    '发送错误诊断': 'Send error diagnostics', '推荐开启': 'Recommended', '由环境变量控制': 'Controlled by environment variable', '默认开启 · 设置读取失败': 'Enabled by default · failed to read setting', '保存中…': 'Saving…', '此开关控制脱敏错误诊断。匿名安装数和日活独立统计（随机安装标识、系统、架构、版本、客户端类型及出口国家），不受此开关影响。不包含账号、会话内容、Token 或 API Key。': 'This switch controls redacted error diagnostics. Anonymous installation and daily active counts are collected independently (random installation ID, system, architecture, version, client type, and network country). No accounts, session content, tokens, or API keys.', '查看错误诊断说明': 'View diagnostics details', '问题反馈': 'Report an issue', '会话监听日志': 'Session monitor log', '仅保存在当前页面内存': 'Stored only in this page memory',
     '权限免打扰': 'Permission quiet mode', '异常中断会话': 'Continue interrupted sessions', '决策弹窗': 'Decision prompts', '用弹窗提问': 'Ask with a dialog', '确认弹窗自动允许': 'Auto-allow confirmation dialogs', '自动复制所有会话': 'Auto-copy all sessions', '会话消息索引': 'Message index', '引用消息文本': 'Quote message text', '选择登录方式': 'Choose a login method', '假退出': 'Soft logout', '无感登录': 'Seamless login',
     '未设置': 'Not set', '当前使用中': 'Currently active', '停止生成': 'Stop generating', '正常重启': 'Restart normally', '清空日志': 'Clear log', '开发者工具': 'Developer tools', '隐藏功能': 'Hidden feature', '卡死': 'Stuck', '任务': 'Task', '空间': 'Workspace', '全部': 'All', '今天': 'Today', '近 7 天': 'Last 7 days', '近 30 天': 'Last 30 days', '企业配额': 'Enterprise quota', '积分到期分布': 'Credit expiry distribution',
     '连接新服务…': 'Connecting to service…', '等待中': 'Waiting', '运行中': 'Running', '空闲': 'Idle', '已中断': 'Interrupted', '已停止': 'Stopped', '未确认': 'Unconfirmed', '等待确认': 'Waiting for confirmation', '等待新回复': 'Waiting for a new reply', '等待会话': 'Waiting for session', '等待允许': 'Waiting for approval', '整理中': 'Organizing', '恢复中': 'Restoring', '即将完成…': 'Finishing…', '已继续': 'Continued', '检测到会话异常中断，即将自动发送「': 'An interrupted session was detected. Sending “', '自动发送失败，请手动点击发送': 'Automatic send failed. Please click Send manually', '底层发送失败，请手动发送': 'Underlying send failed. Please send manually',
     '导入中…': 'Importing…', ' 个任务': ' task(s)', '导入任务': 'Import tasks', '导出任务': 'Export tasks', '请先勾选要导出的任务': 'Select tasks to export first', '选择 JSON 或 ZIP 任务文件': 'Choose a JSON or ZIP task file', '读取任务文件…': 'Reading task file…', '任务导出成功': 'Tasks exported', '导入失败': 'Import failed', '导出失败': 'Export failed', '可导入': 'Ready to import', '已存在，将跳过': 'Already exists; skipped', '不兼容，无法导入': 'Incompatible; cannot import', '导入后保持停用，可在任务列表中启用。相同 ID 的任务会跳过。': 'Imported tasks stay disabled until you enable them. Existing task IDs are skipped.', '任务文件不能超过 8 MiB': 'Task files must not exceed 8 MiB', '缺少必填参数': 'Required inputs are missing', '需要更新 WorkDaddy': 'Requires a newer WorkDaddy version', '不支持当前客户端或系统': 'Unsupported client or platform', '文件不是自动化任务 JSON': 'Not an automation task JSON file', '任务格式或能力不受支持': 'Unsupported task format or capabilities',
     '导出账号': 'Export accounts', '导入账号': 'Import accounts', '导出会话': 'Export sessions', '导入会话': 'Import sessions', '导出快捷短语': 'Export quick phrases', '导入快捷短语': 'Import quick phrases', '复制选中到其他账号': 'Copy selected to another account', '删除选中': 'Delete selected', '操作会话': 'Session actions', '连通测试': 'Test connection', '编辑模型': 'Edit model', '模型已保存': 'Model saved', '模型已启用': 'Model enabled', '模型已复制': 'Model copied', '模型配置已共用': 'Model configuration shared', '当前模型': 'Current model', '备选模型': 'Backup models', '模型加载失败：': 'Failed to load models: ', '保存模型失败：': 'Failed to save model: ', '删除当前模型失败：': 'Failed to delete current model: ', '启用模型失败：': 'Failed to enable model: ', '连通测试失败：': 'Connection test failed: ',
     '选择要查看的账号': 'Choose an account to view', '选择账号并输入密码后导出备份': 'Choose accounts and enter a password to export backups', '从加密导出文件导入账号备份': 'Import account backups from an encrypted export', '使用密码导出选中会话': 'Export selected sessions with a password', '使用密码导出选中快捷短语': 'Export selected quick phrases with a password', '从加密文件导入会话': 'Import sessions from an encrypted file', '从加密文件导入快捷短语': 'Import quick phrases from an encrypted file', '仅支持 PNG / JPG / WebP': 'PNG / JPG / WebP only', '点击或拖拽上传壁纸': 'Click or drag to upload a wallpaper', '点击选择图片，或拖拽到此处': 'Click to choose an image, or drag it here', '支持 PNG / JPG / WebP，自动压缩；可添加多张': 'PNG / JPG / WebP supported; images are compressed automatically',
-    '未命名账号': 'Unnamed account', '未命名模型': 'Unnamed model', '未命名': 'Unnamed', '未知错误': 'Unknown error', '未知': 'Unknown', '有效期未知': 'Expiry unknown', '未找到输入框': 'Composer not found', '输入框内容为空': 'Composer is empty', '当前输入框暂不支持引用插入': 'The current composer does not support quote insertion', '引用插入失败，请重试': 'Could not insert quote. Please try again', '已引用选中文字': 'Selected text quoted', '短语不能为空': 'Quick phrase cannot be empty', '请输入快捷短语': 'Enter a quick phrase', '删除快捷短语': 'Delete quick phrase', '编辑快捷短语': 'Edit quick phrase', '新增快捷短语': 'Add quick phrase', '确定删除': 'Confirm deletion', '确认永久删除': 'Confirm permanent deletion',
+    '未命名账号': 'Unnamed account', '未命名模型': 'Unnamed model', '未命名': 'Unnamed', '未知错误': 'Unknown error', '未知': 'Unknown', '有效期未知': 'Expiry unknown', '未找到输入框': 'Composer not found', '输入框内容为空': 'Composer is empty', '当前输入框暂不支持引用插入': 'The current composer does not support quote insertion', '引用插入失败，请重试': 'Could not insert quote. Please try again', '短语不能为空': 'Quick phrase cannot be empty', '请输入快捷短语': 'Enter a quick phrase', '删除快捷短语': 'Delete quick phrase', '编辑快捷短语': 'Edit quick phrase', '新增快捷短语': 'Add quick phrase', '确定删除': 'Confirm deletion', '确认永久删除': 'Confirm permanent deletion',
     '本机回环 CDP 注入 · 不改官方安装包': 'Local CDP injection · official app untouched', '一个基于 ': 'A ', ' 的 WorkBuddy 桌面端增强工具。零侵入、零重签名——只把界面组件注入到正在运行的 WorkBuddy 渲染进程里。': ' WorkBuddy desktop enhancement tool using Chrome DevTools Protocol (CDP). No intrusion or re-signing; UI components are injected into the running renderer.', '问题反馈': 'Report an issue',
     // —— 覆盖度补齐（分区域，模板条目支持 {name} 占位，匹配时最长优先）——
     '(无标题)': 'Untitled', 'GitHub 仓库': 'GitHub repository', '去 GitHub Issues 反馈问题': 'Report an issue on GitHub', '在 GitHub 上给 WorkDaddy 点 Star': 'Star WorkDaddy on GitHub', 'WorkDaddy，点击打开面板，可拖动': 'WorkDaddy – click to open the panel, draggable', '如果 WorkDaddy 对你有帮助，欢迎在 GitHub 点个 Star。你的支持会让这个小项目持续更新。': 'If WorkDaddy helps you, please star it on GitHub. Your support keeps this small project alive.',
@@ -723,6 +898,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // —— 模板条目（{name}/{n} 占位，最长优先整句替换，杜绝中英混合）——
     '已切换为「{name}」，开始领取积分…': 'Switched to “{name}”, claiming credits…', '已切换为「{name}」，正在复制已标记会话…': 'Switched to “{name}”, copying marked sessions…', '已登录「{name}」': 'Logged in as “{name}”', '已发送「{text}」': 'Sent “{text}”', '「{name}」的备份': 'Backup of “{name}”', '「{name}」的本地备份，不可恢复': 'Local backup of “{name}”, cannot be restored', '「{name}」，请刷新 WorkBuddy 窗口': '“{name}”, please refresh the WorkBuddy window', '「{name}」，重启后生效': '“{name}”, effective after restart', '定位到第{n}条用户消息': 'Jump to user message {n}', '已关闭：{reason}': 'Disabled: {reason}', '已开启：{reason}': 'Enabled: {reason}', '已删除 {n} 项': 'Deleted {n} item(s)', '已复制 {n} 项': 'Copied {n} item(s)', '检测到会话异常中断，即将自动发送「{text}」': 'An interrupted session was detected. Sending “{text}”', '输入框非空，已放弃会话 {id} 的自动继续': 'Composer is not empty; skipped auto-continue for session {id}',
     // —— 第二批补齐（inject 剩余 + daemon 端会进入 UI/API 的文案）——
+    '没有找到符合格式的账号，请先让 WorkBuddy 整理 JSON': 'No compatible accounts found. Ask WorkBuddy to format the JSON first.',
     '免打扰': 'Quiet mode', 'WorkBuddy 即将退出并重新打开到登录页': 'WorkBuddy will exit and reopen to the login page', 'WorkBuddy 队列尚未准备完成': 'WorkBuddy queue is not ready yet', 'WorkBuddy 队列排序接口不可用': 'WorkBuddy queue sort API unavailable', 'WorkBuddy 队列立即发送接口不可用': 'WorkBuddy queue send-now API unavailable', '未找到 WorkBuddy 队列接口': 'WorkBuddy queue API not found',
     '一个基于': 'A ', '个备选': 'standby', '备选': 'standby', '个失败': ' failed', '个已不存在': ' no longer exist', '项失败': ' failed', '已选': ' selected', '例如 deepseek-v4-flash': 'e.g. deepseek-v4-flash', '例如我的 DeepSeek': 'e.g. my DeepSeek', '加载失败': 'Load failed', '发起授权失败:': 'Authorization failed:', '开启': 'Enable', '关闭': 'Close', '失败': 'Failed', '用户消息': 'User message',
     'OLED 纯黑': 'OLED Pure Black', '未发现 CDP 端口（WorkBuddy 需以 --remote-debugging-port 启动）': 'No CDP port found (start WorkBuddy with --remote-debugging-port)', '本地 API 未授权': 'Local API unauthorized', '仅支持 http(s) 链接': 'Only http(s) links are supported', '图片不能超过 10MB': 'Image must not exceed 10MB', '图片必须是 PNG/JPEG/WebP base64': 'Image must be PNG/JPEG/WebP base64', '遥测开关值必须是布尔值': 'Telemetry switch must be a boolean', 'blur 必须是数字': 'Blur must be a number', 'opacity 必须是数字': 'Opacity must be a number', '查询返回空结果': 'Query returned empty results',
@@ -753,10 +929,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '时间': 'Time', '自动复制': 'Auto-copy', '模型名': 'Model name', '自定义名称': 'Custom name', '确认操作': 'Confirm operation', '小贴士': 'Tip',
     '解决 WorkBuddy 不支持多个同名模型的问题。': 'Solves WorkBuddy not supporting multiple models with the same name.',
     '清空': 'Clear', '继续': 'Continue', '更换': 'Change',
+    '删除所有账号副本': 'Delete across accounts', '删除选中会话及所有账号的同源副本': 'Delete selected sessions and their linked copies across accounts',
+    '删除所有账号的同源会话？': 'Delete linked sessions across all accounts?', '再次确认永久删除': 'Confirm permanent deletion again',
+    '继续确认': 'Continue to confirmation', '永久删除': 'Delete permanently',
+    '将永久删除所选会话，以及已关联到其他账号的所有同源副本、消息文件和本地缓存。此操作不可恢复。': 'Permanently deletes the selected sessions and all linked copies, message files and local cache across accounts. This cannot be undone.',
+    '消息文字阴影': 'Message text shadow', '增强壁纸上的消息文字辨识度': 'Improve message readability over wallpaper',
+    '文字阴影设置失败: ': 'Could not set text shadow: ', '读取文字阴影失败: ': 'Could not load text shadow: ',
+    '悬浮机器人': 'Floating robot', '机器人外观': 'Robot appearance', '白色': 'White', '黑色': 'Black',
+    '白底黑眼': 'White shell, black eyes', '黑底白眼': 'Black shell, white eyes', '毛玻璃底与镂空眼睛': 'Frosted shell, transparent eyes',
+    '自动贴边': 'Auto dock', '闲置 5 秒后收起，鼠标靠近即展开': 'Tuck away after 5 seconds idle; move nearby to reveal',
+    '打开官网；连续点击 5 次开启调试': 'Open website; click five times to enable debug', '点击打开官网': 'Click to open website', '打开官网失败: ': 'Could not open website: ',
     '共 {n} 个': 'Total: {n} ', '展开 {n} 条（': 'Show {n} (', '从 {src} 导入': 'Import from {src}',
     '（': '(', '）': ')',
     // —— 第五批：基础高频词（杜绝词根缺失造成的半句混合）+ 会话/模型/账号错误整句 ——
-    '错误': 'Error', '状态': 'Status', '导航': 'navigation', '消息': 'message', '当前': 'Current', '配置': 'config', '无效': 'invalid', '接口': 'API', '队列': 'queue', '不可用': 'unavailable', '缺少': 'Missing', '未找到页面元素': 'Page element not found', '页面元素不可见': 'Page element is not visible', '无法聚焦页面元素': 'Could not focus page element', 'HTTP URL 仅支持 http(s)': 'HTTP URL must use http(s)', '运行记录不存在': 'Run record not found',
+    '错误': 'Error', '状态': 'Status', '导航': 'navigation', '消息': 'message', '当前': 'Current', '配置': 'config', '无效': 'invalid', '认证数据无效': 'Invalid authentication data', '接口': 'API', '队列': 'queue', '不可用': 'unavailable', '缺少': 'Missing', '未找到页面元素': 'Page element not found', '页面元素不可见': 'Page element is not visible', '无法聚焦页面元素': 'Could not focus page element', 'HTTP URL 仅支持 http(s)': 'HTTP URL must use http(s)', '运行记录不存在': 'Run record not found',
     '会话错误': 'Session error', '会话状态': 'Session status', '会话消息导航': 'Session message navigation', '未获取到当前会话': 'Could not get the current session',
     '回复已停止，但没有发现明确完成证据': 'Reply stopped without clear completion evidence',
     '会话正在等待决策确认': 'Session awaiting a decision confirmation', '会话出现模型或网络错误': 'Session hit a model or network error',
@@ -774,6 +960,24 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '模型索引无效': 'Invalid model index', '模型配置无效': 'Invalid model config', '未选择当前模型': 'No current model selected',
     '模型备份缺少 id/name，无法保存': 'Model backup is missing id/name; cannot save', '模型备份缺少 id/name，无法启用': 'Model backup is missing id/name; cannot enable',
     '不能从当前客户端导入模型': 'Cannot import models from the current client',
+    '来源客户端': 'Source client',
+    '未找到可导入的模型配置': 'No importable model configurations found',
+    '从第三方导入': 'Import from third party',
+    '从 CC Switch 导入模型': 'Import models from CC Switch',
+    '未命名供应商': 'Unnamed provider',
+    'CC Switch 中还没有模型配置': 'No model configurations in CC Switch',
+    '确认覆盖同名模型？': 'Replace models with matching IDs?',
+    '将覆盖 ': 'This will replace ',
+    ' 个现有模型。': ' existing models. ',
+    '所选配置中有 ': 'The selection contains ',
+    ' 个重复模型 ID，当前模型将采用最后一项。': ' duplicate model IDs; the last entry for each ID will become active. ',
+    '导入前会自动备份，所选配置也会保存到「备选模型」。': 'The current configuration will be backed up, and selected configurations will also be saved in Backup models.',
+    ' 个现有模型': ' existing models',
+    '导入失败，请重新读取模型列表': 'Import failed. Reload the model list.',
+    '未检测到 CC Switch 本地模型配置': 'No local CC Switch model configuration found',
+    '读取第三方配置失败': 'Failed to read third-party configuration',
+    '读取 CC Switch 模型失败': 'Failed to read CC Switch models',
+    '，所选配置已保存到「备选模型」': '; selected configurations saved in Backup models',
     '无效的自动复制规则类型': 'Invalid auto-copy rule type', '缺少自动复制规则标识': 'Missing auto-copy rule id', '缺少源账号 uid': 'Missing source account uid',
     '缺少共享会话标识': 'Missing shared session id', '标记仍然存在': 'Marker still present',
     '未找到唯一的当前登录信息文件': 'No unique current login file found', '未找到有效的登录信息文件': 'No valid login file found',
@@ -797,7 +1001,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '删除后会直接修改官方 models.json，已备份到「备选模型」的配置不会受影响。': 'Deleting directly modifies the official models.json; configs backed up under “Backup models” remain unaffected.',
     '当前模型已删除': 'Current model deleted', '删除模型备份？': 'Delete model backup?',
     '删除后无法恢复，但不会影响官方 models.json。': 'Cannot be restored after deletion, but the official models.json is unaffected.',
-    '删除模型备份失败：': 'Failed to delete model backup:', '头像预览': 'Avatar preview', '点击恢复官方头像': 'Click to restore the official avatar',
+    '删除模型备份失败：': 'Failed to delete model backup:', '头像预览': 'Avatar preview', '自定义头像': 'Custom avatar', '自定义': 'Custom', '无效的头像图片': 'Invalid avatar image', '添加头像': 'Add avatar', '删除头像': 'Delete avatar', '头像图片读取失败': 'Could not read avatar image', '头像保存失败，请清理存储空间后重试': 'Could not save avatar; free storage space and retry', '点击恢复官方头像': 'Click to restore the official avatar',
     '未找到该账号已记录的登录文件名，拒绝猜测写入目标': 'No recorded login filename for this account; refusing to guess a write target',
     '「': '“', '」': '”',
     // —— 第七批：头像/主题/安装器/休眠等散落整句 ——
@@ -910,10 +1114,15 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     'CodeBuddy 会话库读取失败:': 'CodeBuddy session DB read failed:',
     '拒绝在文件系统根目录创建会话空间': 'Refusing to create a session workspace at the filesystem root',
     '无效的会话 ID': 'Invalid session ID', '无效的会话文件目标': 'Invalid session file target',
-    '会话附件文件过多，无法导出': 'Too many session attachment files; cannot export', '会话附件超过 256 MB，无法导出': 'Session attachments exceed 256 MB; cannot export',
+    '会话附件发生变化，请重新导出': 'Session attachments changed; please export again',
+    '会话归档元数据过大': 'Session archive metadata is too large', '会话归档元数据无效': 'Invalid session archive metadata',
+    '会话归档不完整或已损坏': 'Session archive is incomplete or corrupted', '不是有效的 WorkDaddy 会话归档': 'Not a valid WorkDaddy session archive',
+    '会话归档包含多余数据': 'Session archive contains unexpected trailing data', '单次最多导出 100 个会话': 'Export at most 100 sessions at a time',
+    '无效的账号归属': 'Invalid account ownership',
+    '会话附件文件过多，无法导出': 'Too many session attachment files; cannot export',
     '会话归档包含无效 ID': 'Session archive contains an invalid ID', '会话归档包含无效附件': 'Session archive contains an invalid attachment',
     '会话归档附件文件过多': 'Session archive has too many attachment files', '会话归档包含重复附件路径': 'Session archive contains duplicate attachment paths',
-    '会话归档附件超过 256 MB': 'Session archive attachments exceed 256 MB', '会话归档缺少有效的账号归属': 'Session archive is missing a valid account owner',
+    '会话归档缺少有效的账号归属': 'Session archive is missing a valid account owner',
     '首次会话播种持久化失败': 'Initial session seeding failed to persist',
     '导入文件中没有快捷短语': 'No quick phrases found in the import file', '单次最多导入 {n} 条快捷短语': 'Import at most {n} quick phrases at a time',
     '没有可导入的快捷短语': 'No quick phrases to import', '暂存记录不存在:': 'Stashed record not found:', '暂存内容为空': 'Stash content is empty',
@@ -933,7 +1142,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '蒙版已保存但应用失败:': 'Overlay saved but failed to apply:', '模糊设置已保存但应用失败:': 'Blur setting saved but failed to apply:',
     '无法清空输入框': 'Could not clear the composer', '未找到发送按钮': 'Send button not found', '未找到操作栏': 'Toolbar not found',
     // —— 第十五批：面板入口描述与连接状态 ——
-    '面板入口：': 'Panel entry:', '右下角机器人按钮': 'Bottom-right robot button', '已连接': 'Connected', '未连接': 'Not connected'
+    '首次加载时间较长，请等候': 'The first load may take a little longer. Please wait.',
+    '面板入口：': 'Panel entry:', '右下角机器人按钮': 'Bottom-right robot button', '已连接': 'Connected', '未连接': 'Not connected',
+    'Token 用量': 'Token usage', '正在读取统计…': 'Loading statistics…', '搜索': 'Search', '重置': 'Reset', '调用': 'Calls', '输入': 'Input', '输出': 'Output', '导入方式': 'Import method', '复制提示词': 'Copy prompt', '导入 WorkDaddy 加密文件': 'Import WorkDaddy encrypted file', '导入 WorkDaddy 导出的账号备份，选择文件后输入导出密码。': 'Import an account backup exported by WorkDaddy, then enter its export password.', '导入 JSON 文件': 'Import JSON file', '可以导入其他工具导出的明文账号。请先让 WorkBuddy 按指定格式整理，再选择生成的 JSON 文件。': 'Import plain-text accounts exported by another tool. Ask WorkBuddy to convert them to the required format, then choose the generated JSON file.', '把其他工具导出的账号文本发给 WorkBuddy，让它只输出符合 WorkDaddy 格式的 JSON，然后复制保存为文件。': 'Send the account text exported by another tool to WorkBuddy. Ask it to output only WorkDaddy-compatible JSON, then save it as a file.', '提示词已复制': 'Prompt copied', '选择文件': 'Choose file',
+    '缓存读取': 'Cache read', '缓存写入': 'Cache write',
+    ' 个文件，解析失败': ' files, parse failures', ' 行': ' lines', '暂无可统计的 Token 用量': 'No Token usage found',
+    '当前积分段已用完': 'The current credit segment is used up', '积分将在': ' credits expire in', '到期': ' expires', '要切换账号吗？': 'Switch account?', '可以切换到账号': 'Can switch to account', '检测到积分到期时间最临近的账号': 'The account with the nearest credit expiry is', '积分将于': ' credits expire within', '内过期': '', '较长时间': 'a long time',
+    '切换到此账号': 'Switch to this account', '今天不再提醒': 'Do not remind me again today', '关闭': 'Close',
+    '切换中…': 'Switching…', 'Token 用量统计': 'Token usage statistics', ' 分钟后': ' minutes', ' 小时后': ' hours', ' 天后': ' days',
+    '未设置时间': 'no expiry time', '时间': 'Time', '近 7 天': 'Last 7 days', '近 30 天': 'Last 30 days', '近 90 天': 'Last 90 days',
+    '账号': 'Account', '全部账号': 'All accounts', '模型': 'Model', '全部模型': 'All models', '刷新': 'Refresh', '刷新统计': 'Refresh statistics', '开始日期': 'From', '结束日期': 'To',
+    '每日趋势': 'Daily trend', '暂无趋势数据': 'No trend data', '模型排行': 'Model ranking', ' 次': ' calls', '暂无模型数据': 'No model data', '暂无账号数据': 'No account data'
   };
   function wbsSystemLanguage() {
     var value = String((navigator && (navigator.language || navigator.userLanguage)) || '').toLowerCase();
@@ -1032,6 +1251,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     return out;
   }
 
+  function wbsIsBuiltinAutomation(task) {
+    return !!task && [
+      'buddy-fuel-station-close-on-account-switch',
+      'daily-account-checkin',
+      'keep-accounts-active-1-plus-1'
+    ].indexOf(task.id) >= 0;
+  }
+
   function wbsBuiltinAutomationText(task, field) {
     var defaults = {
       "daily-account-checkin": {
@@ -1056,7 +1283,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           "页面就绪后自动关闭首页弹窗"
         ],
         "description": [
-          "页面就绪后立即检查三类弹窗，每 300 毫秒补查，持续约 30 秒；重新出现的弹窗继续关闭，快速切换账号时重新检测新页面。"
+          "页面就绪后立即检查三类弹窗，每 300 毫秒补查，持续约 30 秒；重新出现的弹窗继续关闭，快速切换账号时重新检测新页面。",
+          "页面就绪后立即检查首页弹窗与运营位，每 300 毫秒补查，持续约 30 秒；重新出现的弹窗继续关闭，快速切换账号时重新检测新页面。"
         ]
       }
     };
@@ -1102,7 +1330,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
   var accountMaskEnabled = false;
   try { accountMaskEnabled = localStorage.getItem(WBS_ACCOUNT_MASK_KEY) === '1'; } catch (_) {}
-  var state = { accounts: [], current: null, open: false, batchRunning: false, creditRunId: 0, activityRunId: 0, creditRemaining: 0, creditSummaryValue: null, mask: accountMaskEnabled };
+  var state = { accounts: [], current: null, open: false, batchRunning: false, creditRunId: 0, activityRunId: 0, creditRemaining: 0, creditSummaryValue: null, mask: accountMaskEnabled, rotationNotice: null, rotationPromptDay: '' };
   var currentBuild = null;
   // 当前注入的 daemon 版本号（由 daemon.js 注入时把 __WBS_VERSION__ 替换为 DAEMON_VERSION）
   // 「关于」tab 直接展示，升级 daemon 后这里自动同步
@@ -1124,7 +1352,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   })();
 
   // 纯图标 SVG（stroke 跟随按钮 currentColor）
-  var PRIMARY_ACCOUNT_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 7 4.5 4L12 4l4.5 7L21 7l-2 11H5L3 7Z"/><path d="M6 21h12"/></svg>';
   var SWITCH_SVG =
     '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
     '<path d="M16 3l4 4-4 4"/><path d="M20 7H8"/><path d="M8 21l-4-4 4-4"/><path d="M4 17h12"/></svg>';
@@ -1185,6 +1412,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
     '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>' +
     '<polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
+  var CREDIT_SUMMARY_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 20h16M7 16V9m5 7V4m5 12v-5"/></svg>';
+  var TOKEN_STATS_ICON =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M4 19V5M4 19h16"/><path d="m7 15 3-4 3 2 5-7"/></svg>';
   // 脱敏小眼睛：睁眼 = 明文可见（点击后隐藏）；闭眼（斜线） = 已脱敏（点击后显示明文）
   var EYE_SVG =
     '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
@@ -1231,11 +1462,96 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   function esc(t) { return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
   function escAttr(t) { return esc(t).replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
 
+  // 每个积分段只归入一个剩余天数桶；缺失有效期的余额不展示，不猜测到期日。
+  function summarizeCreditDays(accounts, now) {
+    var buckets = new Map(), unavailable = 0, unlimited = 0;
+    function add(days, credits) {
+      if (credits > 0 && isFinite(credits)) buckets.set(days, (buckets.get(days) || 0) + credits);
+    }
+    (accounts || []).forEach(function (account) {
+      if (account.creditUnlimited) { unlimited++; return; }
+      if (account.creditExpired || isIdentityExpired(account) || typeof account.credits !== 'number' || !isFinite(account.credits)) { unavailable++; return; }
+      var balance = Math.max(0, account.credits);
+      var segments = Array.isArray(account.creditSegments) ? account.creditSegments : [];
+      segments.forEach(function (segment) {
+        if (!segment || !isFinite(Number(segment.remaining))) return;
+        var amount = Math.min(balance, Math.max(0, Number(segment.remaining)));
+        var expiry = segment.expiresAt;
+        var days = expiry !== null && expiry !== undefined && expiry !== '' && isFinite(Number(expiry))
+          ? Math.max(0, Math.ceil((Number(expiry) - now) / 86400000)) : null;
+        add(days, amount); balance -= amount;
+      });
+      add(null, balance);
+    });
+    return { rows: Array.from(buckets, function (item) { return { days: item[0], credits: item[1] }; }).filter(function (row) { return row.days !== null; }).sort(function (a, b) {
+      if (a.days === b.days) return 0;
+      if (a.days === null) return 1;
+      if (b.days === null) return -1;
+      return a.days - b.days;
+    }), accountCount: (accounts || []).length, unavailable: unavailable, unlimited: unlimited };
+  }
+
+  function creditOpacity(days) {
+    if (days === null || days === undefined || !isFinite(Number(days))) return 1;
+    return 0.05 + 0.95 * Math.max(0, Math.min(29, Number(days) - 1)) / 29;
+  }
+
+  function createAvatarLibrary(storage) {
+    var key = 'wbsAvatarLibrary', state = { selected: 'workbuddy', items: [] };
+    function validImage(src) { return typeof src === 'string' && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(src); }
+    try {
+      var saved = JSON.parse(storage.getItem(key) || 'null');
+      if (saved && Array.isArray(saved.items)) {
+        var ids = new Set();
+        state.items = saved.items.filter(function (item) {
+          if (!item || typeof item.id !== 'string' || !/^custom-[a-z0-9-]+$/.test(item.id) || ids.has(item.id) || !validImage(item.src)) return false;
+          ids.add(item.id); return true;
+        }).map(function (item) { return { id: item.id, src: item.src }; });
+        if (saved.selected === 'workbuddy' || saved.selected === 'workdaddy' || ids.has(saved.selected)) state.selected = saved.selected;
+      } else {
+        var legacy = storage.getItem('wbsAvatar');
+        if (validImage(legacy)) { state.items = [{ id: 'custom-legacy', src: legacy }]; state.selected = 'custom-legacy'; }
+        else if (legacy === 'workdaddy') state.selected = 'workdaddy';
+      }
+    } catch (_) {}
+    function snapshot() { return { selected: state.selected, items: state.items.map(function (item) { return { id: item.id, src: item.src }; }) }; }
+    function commit(next) {
+      storage.setItem(key, JSON.stringify(next));
+      state = next;
+      try { storage.removeItem('wbsAvatar'); } catch (_) {}
+    }
+    return {
+      snapshot: snapshot,
+      select: function (id) {
+        if (id !== 'workbuddy' && id !== 'workdaddy' && !state.items.some(function (item) { return item.id === id; })) return;
+        var next = snapshot(); next.selected = id; commit(next);
+      },
+      add: function (src) {
+        if (!validImage(src)) throw new Error('无效的头像图片');
+        var next = snapshot(), id;
+        do { id = 'custom-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10); }
+        while (next.items.some(function (item) { return item.id === id; }));
+        next.items.push({ id: id, src: src }); next.selected = id; commit(next); return id;
+      },
+      remove: function (id) {
+        if (!state.items.some(function (item) { return item.id === id; })) return;
+        var next = snapshot(); next.items = next.items.filter(function (item) { return item.id !== id; });
+        next.selected = 'workdaddy'; commit(next);
+      },
+    };
+  }
+
+  function resolveAvatarChoice(saved, official, brand) {
+    if (saved === 'workdaddy') return { preset: 'workdaddy', src: brand };
+    if (typeof saved === 'string' && /^data:image\/(png|jpeg|webp);base64,/.test(saved)) return { preset: 'custom', src: saved };
+    return { preset: 'workbuddy', src: official };
+  }
+
   function checkinHtml(a) {
     if (WBS_PROFILE_IS_AI) return '';
     var c = a && a.checkin;
     var checked = !!(c && c.ok && !c.inactive);
-    return '<span class="wbs-ck wbs-checkin-tag ' + (checked ? 'ok' : 'pending') + '" title="' + (checked ? '今日已签到' : '今日尚未签到') + '">今日签到</span>';
+    return '<span class="wbs-ck wbs-checkin-tag ' + (checked ? 'ok' : 'pending') + '" title="' + (checked ? '今日已签到' : '今日未签到') + '">' + (checked ? '今日已签到' : '今日未签到') + '</span>';
   }
 
   function activityStreakHtml(a) {
@@ -1291,7 +1607,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
     headers['X-WorkDaddy-Token'] = WBS_API_TOKEN;
     request.headers = headers;
+    delete request.responseType;
     return fetch(API + path, request).then(function (r) {
+      if (r.ok && opts.responseType === 'blob') return r.blob().then(function (blob) {
+        return { content: blob, mimeType: 'application/octet-stream', count: Number(r.headers.get('X-WorkDaddy-Count') || 0) };
+      });
       return r.json().then(function (j) {
         if (!r.ok || j.ok === false) {
           var error = new Error(j.error || '请求失败');
@@ -1474,6 +1794,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   function build() {
     var lifecycle = createBuildLifecycle();
     var registerDisposer = lifecycle.registerDisposer;
+    var usageActivity = createUsageActivity({ document: document, window: window,
+      now: Date.now,
+      send: function () { return api('/api/usage', { method: 'POST' }); } });
+    registerDisposer(function () { usageActivity.destroy(); });
     var alive = true;
     var buildTimeouts = [];
     var buildIntervals = [];
@@ -1869,29 +2193,27 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     root.innerHTML = [
       '<div class="wbs-fab" title="' + WBS_BRAND + '">',
       '<span class="wbs-fab-health-dot" title="会话状态" style="display:none"></span>',
+      '<svg class="wbs-robot-masks" width="0" height="0" aria-hidden="true" focusable="false"><defs><mask id="wbs-robot-face-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="82" height="64" style="mask-type:luminance">',
+      '<rect width="82" height="64" fill="white"/><rect class="wbs-robot-cutout" x="22" y="23" width="12" height="18" rx="6" fill="black"/><rect class="wbs-robot-cutout" x="48" y="23" width="12" height="18" rx="6" fill="black"/>',
+      '</mask></defs></svg>',
       '<div class="click">',
-      '<span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>',
       '<button class="button up" type="button" aria-label="WorkDaddy，点击打开面板，可拖动">',
       '<span class="wbs-fab-antenna" aria-hidden="true"></span>',
       '<span class="wbs-fab-antenna-dot" id="wbs-fab-sleep-light" title="允许电脑休眠（默认）"></span>',
       '<div class="speak dblink"><div class="wrap"><div class="eye double-blink"></div><div class="eye double-blink"></div></div></div>',
-      '<div class="speak doblink"><div class="wrap"><div class="eye down"></div><div class="eye down"></div></div></div>',
-      '<div class="speak rblink"><div class="wrap"><div class="eye right-blink"></div><div class="eye right-blink"></div></div></div>',
-      '<div class="speak ublink"><div class="wrap"><div class="eye up-blink"></div><div class="eye up-blink"></div></div></div>',
       '</button>',
-      '<button disabled class="button shadow"></button>',
       '</div>',
       '</div>',
       '<div class="wbs-panel">',
       '<div class="wbs-head">',
       '<div class="wbs-head-left">',
-      '<div class="wbs-title-wrap"><div class="wbs-title-row"><div class="wbs-title" id="wbs-title" title="WorkDaddy">' + WBS_BRAND + '</div>',
+      '<div class="wbs-title-wrap"><div class="wbs-title-row">',
+      '<button class="wbs-brand" id="wbs-title" type="button" title="点击打开官网">',
+      '<span class="wbs-brand-copy"><span class="wbs-title">' + WBS_BRAND + '</span><span class="wbs-version-line" id="wbs-version-line"></span></span>',
+      '</button>',
       '<button class="wbs-pick-btn" id="wbs-pick-btn" type="button" style="display:none" title="元素检查">🔍</button>',
       '<span class="wbs-health-status" id="wbs-health-status" aria-live="polite"></span>',
-      '<a class="wbs-ghbtn" href="https://github.com/babygoton/WorkDaddy" target="_blank" rel="noopener" title="GitHub 仓库">',
-      '<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M12 .3a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.11-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 12 .3z"/></svg>',
-      '</a>',
-      '</div><div class="wbs-version-line" id="wbs-version-line"></div></div>',
+      '</div></div>',
       '</div>',
       '<button class="wbs-btn-close" type="button" data-act="close">✕</button>',
       '</div>',
@@ -2218,9 +2540,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
       var request = { contentBlocks: [selectionQuoteBlock(pending.text)] };
       try {
-        Promise.resolve(adapter.requestInsertContentBlocks(request)).then(function () {
-          toast('已引用选中文字', false, root);
-        }).catch(function () {
+        Promise.resolve(adapter.requestInsertContentBlocks(request)).catch(function () {
           toast('引用插入失败，请重试', true, root);
         });
       } catch (_) {
@@ -2953,6 +3273,13 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
       function updateActive() {
         if (!surface || !turns.length) return;
+        // 末条消息较短时无法顶齐视口；到底后直接对应最后一轮，避免顶部位置推断选回上一轮。
+        var scroll = surface.scrollElement;
+        if (scroll && scroll.scrollHeight > scroll.clientHeight &&
+            scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <= 2) {
+          setActive(turns[turns.length - 1].id);
+          return;
+        }
         var viewport = surface.viewportElement.getBoundingClientRect();
         var frames = surface.conversationElement.querySelectorAll('.cr-document__virtual-item[data-index]');
         var visibleMessageIndex = -1;
@@ -4239,6 +4566,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     });
 
     var fab = root.querySelector('.wbs-fab');
+    var fabAppearance = createFabAppearance({ fab: fab, storage: localStorage, key: 'wbs-fab-style-' + PROFILE_ID });
     var panel = root.querySelector('.wbs-panel');
     var body = root.querySelector('.wbs-body');
     var accountsPane = root.querySelector('[data-pane="account"]');
@@ -4290,6 +4618,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     if (accountsPane) {
+      var accountImportMode = 'encrypted';
       listen(accountsPane, 'mouseover', function (event) {
         var segment = findCreditSegment(event.target);
         if (!segment || segment === creditTooltipSegment) return;
@@ -4318,23 +4647,194 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<button class="wbs-acct-eye" type="button" title="隐藏敏感信息" aria-label="隐藏敏感信息">' + EYE_SVG + '</button>' +
         '<span class="wbs-acct-stat-divider"></span>' +
         '<div class="wbs-acct-stat"><span>总积分</span><strong id="wbs-acct-total">-</strong></div>' +
+        '<button class="wbs-acct-eye" type="button" data-act="credit-summary" title="汇总" aria-label="积分汇总" aria-expanded="false">' + CREDIT_SUMMARY_ICON + '</button>' +
         '</div>' +
         '<div class="wbs-acct-actions">' +
-        '<button class="wbs-acct-io" type="button" data-act="export" title="选择账号并输入密码后导出备份">' + EXPORT_ICON + '<span>导出</span></button>' +
-        '<button class="wbs-acct-io" type="button" data-act="import" title="从加密导出文件导入账号备份">' + IMPORT_ICON + '<span>导入</span></button>' +
+        '<button class="wbs-acct-io wbs-acct-icon" type="button" data-act="token-stats" title="用量统计" aria-label="用量统计">' + TOKEN_STATS_ICON + '</button>' +
+        '<button class="wbs-acct-io wbs-acct-icon" type="button" data-act="export" title="选择账号并输入密码后导出备份" aria-label="导出账号">' + EXPORT_ICON + '</button>' +
+        '<button class="wbs-acct-io wbs-acct-icon" type="button" data-act="import" title="从加密导出文件导入账号备份" aria-label="导入账号">' + IMPORT_ICON + '</button>' +
+        '<button class="wbs-acct-io wbs-acct-icon" type="button" data-act="account-more" title="账号排序" aria-label="账号排序"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 4v16m-4-4 4 4 4-4M14 5h7m-7 5h5m-5 5h3"/></svg></button>' +
         '</div>' +
         '</div>' +
         '<div class="wbs-acct-list"></div>' +
         '<button class="wbs-logout-btn" type="button" data-act="logout">' + LOGOUT_SVG + '<span>登录新账号</span></button>' +
         '<input type="file" id="wbs-import-file" accept=".json,application/json" style="display:none">';
+      root.querySelector('[data-act="account-more"]').addEventListener('click', openAccountOrderModal);
+      setupCreditSummary();
       logoutBtn = root.querySelector('[data-act="logout"]');
       var eyeBtn = root.querySelector('.wbs-acct-eye');
       if (eyeBtn) eyeBtn.addEventListener('click', toggleAccountMask);
       root.querySelector('[data-act="export"]').addEventListener('click', onExportAccounts);
+      root.querySelector('[data-act="token-stats"]').addEventListener('click', onTokenStats);
       root.querySelector('[data-act="import"]').addEventListener('click', function () {
-        root.querySelector('#wbs-import-file').click();
+        openAccountImportChoice();
       });
       root.querySelector('#wbs-import-file').addEventListener('change', onImportFile);
+    }
+
+    function openAccountOrderModal() {
+      var existing = root.querySelector('#wbs-account-order-mask');
+      if (existing) return;
+      var previousFocus = document.activeElement;
+      var mask = el('div', 'wbs-modal-mask wbs-modal-mask-panel');
+      mask.id = 'wbs-account-order-mask';
+      var mode = state.accountOrder && state.accountOrder.mode === 'fixed' ? 'fixed' : 'expiry';
+      var ordered = state.accounts.slice().sort(function (a, b) {
+        var left = Number(a.sort) > 0 ? Number(a.sort) : Infinity;
+        var right = Number(b.sort) > 0 ? Number(b.sort) : Infinity;
+        return left === right ? 0 : left - right;
+      });
+      mask.innerHTML = '<div class="wbs-modal wbs-account-order-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-account-order-title">' +
+        '<div class="wbs-modal-title" id="wbs-account-order-title">账号排序</div>' +
+        '<div class="wbs-account-order-modes"><label><input type="radio" name="wbs-account-order" value="expiry">按积分临近时间</label>' +
+        '<label><input type="radio" name="wbs-account-order" value="fixed">固定顺序</label></div>' +
+        '<div data-fixed-order>' +
+        '<div class="wbs-account-order-list" role="list" aria-label="固定账号顺序"></div></div>' +
+        '<div class="wbs-password-error" role="alert"></div><div class="wbs-modal-actions">' +
+        '<button class="wbs-modal-btn" type="button" data-order-cancel>取消</button>' +
+        '<button class="wbs-modal-btn wbs-modal-ok" type="button" data-order-save>保存</button></div></div>';
+      panel.appendChild(mask);
+      var list = mask.querySelector('.wbs-account-order-list');
+      var busy = false, dragged = null;
+      function close() {
+        if (busy) return;
+        mask.remove();
+        if (previousFocus && previousFocus.isConnected) previousFocus.focus();
+      }
+      function drawRows() {
+        list.innerHTML = ordered.map(function (a, index) {
+          var name = a.nickname || '未命名';
+          return '<div class="wbs-account-order-row" draggable="true" role="listitem" data-order-index="' + index + '">' +
+            '<button type="button" class="wbs-acct-eye" data-order-handle title="拖拽排序，或按上下方向键调整" aria-label="调整账号顺序">' +
+            '<svg width="14" height="16" viewBox="0 0 14 16" fill="currentColor" aria-hidden="true"><path d="M3 2h2v2H3zm6 0h2v2H9zM3 7h2v2H3zm6 0h2v2H9zM3 12h2v2H3zm6 0h2v2H9z"/></svg></button>' +
+            '<span data-wbs-i18n-skip>' + esc(name) + '</span></div>';
+        }).join('') || '<div class="wbs-empty">暂无账号</div>';
+      }
+      function move(from, to) {
+        if (busy || from === to || from < 0 || to < 0 || to >= ordered.length) return;
+        ordered.splice(to, 0, ordered.splice(from, 1)[0]);
+        drawRows();
+        list.querySelector('[data-order-index="' + to + '"] button').focus();
+      }
+      function syncMode() {
+        mask.querySelectorAll('input[name="wbs-account-order"]').forEach(function (radio) { radio.checked = radio.value === mode; });
+        mask.querySelector('[data-fixed-order]').hidden = mode !== 'fixed';
+      }
+      mask.addEventListener('change', function (event) {
+        if (!busy && event.target.name === 'wbs-account-order') { mode = event.target.value; syncMode(); }
+      });
+      list.addEventListener('dragstart', function (event) {
+        var row = event.target.closest('[data-order-index]');
+        if (busy || !row) { event.preventDefault(); return; }
+        dragged = Number(row.dataset.orderIndex);
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', String(dragged));
+        row.classList.add('dragging');
+      });
+      list.addEventListener('dragover', function (event) {
+        if (dragged === null || busy) return;
+        event.preventDefault(); event.dataTransfer.dropEffect = 'move';
+        list.querySelectorAll('.drop-target').forEach(function (row) { row.classList.remove('drop-target'); });
+        var row = event.target.closest('[data-order-index]');
+        if (row) row.classList.add('drop-target');
+      });
+      list.addEventListener('drop', function (event) {
+        event.preventDefault();
+        var row = event.target.closest('[data-order-index]');
+        if (row && dragged !== null) move(dragged, Number(row.dataset.orderIndex));
+        dragged = null;
+      });
+      list.addEventListener('dragend', function () {
+        dragged = null;
+        list.querySelectorAll('.dragging,.drop-target').forEach(function (row) { row.classList.remove('dragging', 'drop-target'); });
+      });
+      mask.addEventListener('keydown', function (event) {
+        event.stopPropagation();
+        if (event.key === 'Escape') { event.preventDefault(); close(); }
+        var row = event.target.closest('[data-order-index]');
+        if (row && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+          event.preventDefault();
+          var from = Number(row.dataset.orderIndex);
+          move(from, from + (event.key === 'ArrowUp' ? -1 : 1));
+        }
+        if (event.key === 'Tab') {
+          var focusable = Array.from(mask.querySelectorAll('button,input')).filter(function (node) { return !node.disabled && node.getClientRects().length; });
+          var first = focusable[0], last = focusable[focusable.length - 1];
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+          if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+        }
+      });
+      ['click','dblclick','pointerdown','pointerup','mousedown','mouseup','keyup','keypress','wheel','touchstart','touchmove'].forEach(function (type) {
+        mask.addEventListener(type, function (event) { event.stopPropagation(); });
+      });
+      mask.addEventListener('click', function (event) { if (event.target === mask) close(); });
+      mask.querySelector('[data-order-cancel]').addEventListener('click', close);
+      mask.querySelector('[data-order-save]').addEventListener('click', function () {
+        if (busy) return;
+        busy = true;
+        mask.querySelectorAll('button,input').forEach(function (node) { node.disabled = true; });
+        mask.querySelector('[data-order-save]').textContent = '保存中…';
+        api('/api/accounts/order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: mode, uids: ordered.map(function (a) { return a.uid; }) }) })
+          .then(function (result) {
+            state.accountOrder = result.accountOrder;
+            var ranks = new Map(); ordered.forEach(function (a, index) { ranks.set(a.uid, index + 1); });
+            state.accounts.forEach(function (a) { a.sort = ranks.get(a.uid) || 0; });
+            sortAccountsByCreditExpiry(); reorderAccountCards();
+            busy = false; close();
+          }).catch(function (error) {
+            busy = false;
+            mask.querySelectorAll('button,input').forEach(function (node) { node.disabled = false; });
+            mask.querySelector('[data-order-save]').textContent = '保存';
+            mask.querySelector('[role="alert"]').textContent = error.message || '保存排序失败';
+          });
+      });
+      drawRows(); syncMode();
+      mask.querySelector('input:checked').focus();
+    }
+
+    function setupCreditSummary() {
+      var button = accountsPane.querySelector('[data-act="credit-summary"]');
+      var popup = el('div', 'wbs-credit-summary-popover');
+      popup.id = 'wbs-credit-summary-popover';
+      popup.setAttribute('role', 'region'); popup.setAttribute('aria-label', '按剩余天数汇总积分');
+      popup.hidden = true;
+      button.setAttribute('aria-controls', popup.id);
+      document.body.appendChild(popup);
+      var hideTimer;
+      function hide() { clearTimeout(hideTimer); popup.hidden = true; button.setAttribute('aria-expanded', 'false'); }
+      function deferHide() { clearTimeout(hideTimer); hideTimer = setBuildTimeout(hide, 160); }
+      function show() {
+        clearTimeout(hideTimer);
+        var summary = summarizeCreditDays(state.accounts, Date.now());
+        var max = Math.max.apply(null, summary.rows.map(function (row) { return row.credits; }).concat([1]));
+        popup.innerHTML = '<div class="wbs-credit-summary-head"><strong>积分到期分布</strong><span>剩余天数 · 积分</span></div>' +
+          '<div class="wbs-credit-summary-chart">' + (summary.rows.map(function (row) {
+            var label = row.days === 0 ? '已到期' : row.days + ' 天';
+            return '<div class="wbs-credit-summary-row"><span>' + esc(label) + '</span><div class="wbs-credit-summary-track"><i class="wbs-credit-summary-fill" style="--wbs-credit-alpha:' + creditOpacity(row.days).toFixed(5) + ';width:' + Math.max(1, row.credits / max * 100).toFixed(2) + '%"></i></div><b>' + esc(fmtCredits(row.credits)) + '</b></div>';
+          }).join('') || '<div class="wbs-empty">暂无可汇总积分</div>') + '</div>' +
+          '<div class="wbs-credit-summary-foot">' + summary.accountCount + ' 个账号' +
+          (summary.unavailable ? ' · ' + summary.unavailable + ' 个未获取余额' : '') +
+          (summary.unlimited ? ' · ' + summary.unlimited + ' 个不限量' : '') + '</div>';
+        popup.hidden = false; button.setAttribute('aria-expanded', 'true');
+        var rect = button.getBoundingClientRect();
+        popup.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - popup.offsetWidth - 8)) + 'px';
+        popup.style.top = (rect.bottom + 6) + 'px';
+        popup.style.maxHeight = Math.max(80, window.innerHeight - rect.bottom - 14) + 'px';
+        applyI18n(popup);
+      }
+      listen(button, 'mouseenter', show); listen(button, 'mouseleave', deferHide);
+      listen(button, 'focus', show); listen(button, 'blur', deferHide);
+      listen(button, 'click', show);
+      listen(button, 'keydown', function (event) { if (event.key === 'Escape') { event.stopPropagation(); hide(); } });
+      listen(popup, 'mouseenter', function () { clearTimeout(hideTimer); });
+      listen(popup, 'mouseleave', deferHide);
+      listen(popup, 'wheel', function (event) { event.stopPropagation(); });
+      listen(popup, 'pointerdown', function (event) { event.stopPropagation(); });
+      listen(window, 'resize', hide);
+      listen(accountsPane, 'scroll', hide, true);
+      listen(document, 'keydown', function (event) { if (event.key === 'Escape') hide(); });
+      listen(root, 'click', function (event) { if (event.target !== button && !button.contains(event.target)) hide(); });
+      registerDisposer(function () { hide(); popup.remove(); });
     }
 
     function closeSecureTransferModal(mask) {
@@ -4590,7 +5090,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           onConfirm: function (password) { return api('/api/accounts/import', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: content, password: password }),
+            body: JSON.stringify({ content: content, password: password, format: accountImportMode }),
           }).then(function (r) {
               toast('成功导入 ' + r.count + ' 个账号', false, root);
               refresh();
@@ -4598,6 +5098,312 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           },
         });
       }).catch(function (e) { toast(e.message || '读取文件失败', true, root); });
+    }
+
+    function openAccountImportChoice() {
+      var existing = root.querySelector('#wbs-account-import-choice');
+      if (existing) existing.remove();
+      var mask = document.createElement('div');
+      mask.className = 'wbs-panel-modal-mask';
+      mask.id = 'wbs-account-import-choice';
+      mask.innerHTML = '<div class="wbs-login-modal wbs-import-choice-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-account-import-choice-title">' +
+        '<div class="wbs-login-modal-title" id="wbs-account-import-choice-title">导入账号</div>' +
+        '<div class="wbs-login-body" role="radiogroup" aria-label="导入方式">' +
+        '<label class="wbs-login-option selected" data-import-way="encrypted"><input type="radio" name="wbs-import-way" value="encrypted" checked><span class="wbs-login-option-copy"><span class="wbs-login-option-title">导入 WorkDaddy 加密文件</span><span class="wbs-login-option-desc">导入 WorkDaddy 导出的账号备份，选择文件后输入导出密码。</span></span></label>' +
+        '<label class="wbs-login-option" data-import-way="plain-json"><input type="radio" name="wbs-import-way" value="plain-json"><span class="wbs-login-option-copy"><span class="wbs-login-option-title">导入 JSON 文件</span><span class="wbs-login-option-desc">可以导入其他工具导出的明文账号。请先让 WorkBuddy 按指定格式整理，再选择生成的 JSON 文件。</span></span></label>' +
+        '</div>' +
+        '<div class="wbs-import-json-hint" hidden>把其他工具导出的账号文本发给 WorkBuddy，让它只输出符合 WorkDaddy 格式的 JSON，然后复制保存为文件。</div>' +
+        '<div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" data-import-copy>复制提示词</button><button class="wbs-modal-btn" type="button" data-import-cancel>取消</button><button class="wbs-modal-btn wbs-modal-ok" type="button" data-import-confirm>选择文件</button></div>' +
+        '</div>';
+      (panel || root).appendChild(mask);
+      var options = mask.querySelectorAll('.wbs-login-option');
+      var hint = mask.querySelector('.wbs-import-json-hint');
+      var copyBtn = mask.querySelector('[data-import-copy]');
+      var prompt = '\u8bf7\u628a\u6211\u63d0\u4f9b\u7684\u5176\u4ed6\u5de5\u5177\u8d26\u53f7\u6587\u672c\u6574\u7406\u6210 WorkDaddy \u53ef\u5bfc\u5165\u7684 JSON\u3002\u53ea\u8f93\u51fa JSON\uff0c\u4e0d\u8981 Markdown\uff0c\u4e0d\u8981\u89e3\u91ca\u3002\u683c\u5f0f\u5fc5\u987b\u662f\u5bf9\u8c61\u6570\u7ec4\uff0c\u6bcf\u9879\u5305\u542b account \u5bf9\u8c61\u548c auth \u5bf9\u8c61\uff1baccount.uid \u4e3a\u5b57\u6bcd\u3001\u6570\u5b57\u3001\u4e0b\u5212\u7ebf\u6216\u77ed\u6a2a\u7ebf\uff0cauth.accessToken \u4e3a\u5b57\u7b26\u4e32\uff0c\u5176\u4ed6\u5b57\u6bb5\u6309\u539f\u6587\u4fdd\u7559\u3002\u793a\u4f8b\uff1a[{"account":{"uid":"...","nickname":"..."},"auth":{"accessToken":"...","refreshToken":"..."}}]';
+      function sync() {
+        var selected = mask.querySelector('input[name="wbs-import-way"]:checked');
+        accountImportMode = selected ? selected.value : 'encrypted';
+        for (var i = 0; i < options.length; i++) options[i].classList.toggle('selected', options[i].querySelector('input').checked);
+        hint.hidden = accountImportMode !== 'plain-json';
+        copyBtn.hidden = accountImportMode !== 'plain-json';
+      }
+      for (var i = 0; i < options.length; i++) {
+        options[i].addEventListener('click', sync);
+        options[i].querySelector('input').addEventListener('change', sync);
+      }
+      copyBtn.addEventListener('click', function () { copyPlainText(prompt).then(function () { toast('提示词已复制', false, root); }).catch(function () { toast('复制失败', true, root); }); });
+      mask.querySelector('[data-import-cancel]').addEventListener('click', function () { mask.remove(); });
+      mask.addEventListener('click', function (ev) { if (ev.target === mask) mask.remove(); });
+      mask.querySelector('[data-import-confirm]').addEventListener('click', function () {
+        accountImportMode = (mask.querySelector('input[name="wbs-import-way"]:checked') || {}).value || 'encrypted';
+        mask.remove();
+        root.querySelector('#wbs-import-file').click();
+      });
+      sync();
+    }
+
+    function formatTokenCount(value) {
+      var number = Number(value) || 0;
+      var units = [[1000000000000, 'T'], [1000000000, 'B'], [1000000, 'M'], [1000, 'K']];
+      for (var i = 0; i < units.length; i++) {
+        if (number >= units[i][0]) return (number / units[i][0]).toFixed(2).replace(/\.?0+$/, '') + units[i][1];
+      }
+      return String(Math.round(number));
+    }
+
+    function onTokenStats() {
+      var existing = root.querySelector('#wbs-token-stats-modal');
+      if (existing) { if (existing.__wbsClose) existing.__wbsClose(); else existing.remove(); }
+      var mask = document.createElement('div');
+      mask.id = 'wbs-token-stats-modal';
+      mask.className = 'wbs-modal-mask wbs-modal-mask-panel';
+      mask.innerHTML = '<div class="wbs-modal wbs-token-stats-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-token-stats-title">' +
+        '<div class="wbs-usage-header"><div class="wbs-token-stats-head"><div class="wbs-modal-title" id="wbs-token-stats-title">用量统计</div></div>' +
+        '<div class="wbs-usage-tabs"><button type="button" class="active" data-usage-tab="token">Token</button><button type="button" data-usage-tab="credit">积分</button></div></div><div class="wbs-usage-scroll">' +
+        '<div data-usage-pane="token"><div class="wbs-token-stats-filters"><label>时间<select data-token-days><option value="1">今天</option><option value="7" selected>近 7 天</option><option value="30">近 30 天</option><option value="90">近 90 天</option></select></label><label>账号<select data-token-account><option value="">全部账号</option></select></label><label>模型<select data-token-model><option value="">全部模型</option></select></label></div>' +
+        '<div class="wbs-token-source-note">Token 用量仅统计本机记录，在不同电脑上查看的数据可能不一致。</div>' +
+        '<div class="wbs-token-stats-content"><div class="wbs-token-stats-body"></div><div class="wbs-token-stats-overlay" role="status" aria-label="正在读取统计…"><div class="wbs-token-stats-spinner"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle></svg><span hidden>首次加载时间较长，请等候</span></div></div></div></div>' +
+        '<div data-usage-pane="credit" hidden><div class="wbs-token-stats-filters wbs-credit-filters"><label>时间<select data-credit-days><option value="1">今天</option><option value="7" selected>近 7 天</option><option value="30">近 30 天</option><option value="90">近 90 天</option></select></label><label>账号<select data-credit-account><option value="">全部账号</option></select></label></div>' +
+        '<div data-credit-result role="status" class="wbs-credit-stats-note" hidden></div>' +
+        '<div class="wbs-credit-query-content"><div class="wbs-credit-stats-body wbs-token-stats-body"></div><div class="wbs-credit-sync-overlay" hidden><div class="wbs-credit-sync-progress" role="status" aria-live="polite"><strong>正在查询积分用量…</strong><span data-credit-progress-copy>正在连接…</span><progress data-credit-progress max="100" value="0" aria-label="积分查询进度"></progress><span data-credit-progress-detail></span></div></div></div></div></div>' +
+        '<div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" data-token-close>关闭</button></div></div>';
+      (panel || root).appendChild(mask);
+      var body = mask.querySelector('.wbs-token-stats-body');
+      var creditPollTimer = null;
+      var focusBefore = document.activeElement;
+      function closeStats() {
+        if (creditPollTimer) clearTimeout(creditPollTimer);
+        mask.remove();
+        if (focusBefore && focusBefore.isConnected) focusBefore.focus();
+      }
+      mask.__wbsClose = closeStats;
+      registerDisposer(function () { if (creditPollTimer) clearTimeout(creditPollTimer); mask.remove(); });
+      mask.querySelector('[data-token-close]').addEventListener('click', closeStats);
+      mask.addEventListener('click', function (event) { event.stopPropagation(); if (event.target === mask) closeStats(); });
+      ['pointerdown', 'pointerup', 'keyup', 'keypress'].forEach(function (name) { mask.addEventListener(name, function (event) { event.stopPropagation(); }); });
+      mask.addEventListener('keydown', function (event) {
+        event.stopPropagation();
+        if (event.key === 'Escape') { event.preventDefault(); closeStats(); }
+        if (event.key === 'Tab') {
+          var controls = Array.from(mask.querySelectorAll('button,select,input')).filter(function (el) { return !el.disabled && el.getClientRects().length; });
+          var first = controls[0], last = controls[controls.length - 1];
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+          if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+        }
+      });
+      mask.querySelector('[data-token-close]').focus();
+      var daysSelect = mask.querySelector('[data-token-days]');
+      var accountSelect = mask.querySelector('[data-token-account]');
+      var modelSelect = mask.querySelector('[data-token-model]');
+      var overlay = mask.querySelector('.wbs-token-stats-overlay');
+      var loadedAccounts = [];
+      var hasStats = false;
+      var firstLoadTimer = null;
+      var filterControls = [daysSelect, accountSelect, modelSelect];
+      var creditLoaded = false;
+      var creditDays = mask.querySelector('[data-credit-days]');
+      var creditAccount = mask.querySelector('[data-credit-account]');
+      var creditBody = mask.querySelector('.wbs-credit-stats-body');
+      var creditSyncOverlay = mask.querySelector('.wbs-credit-sync-overlay');
+      var creditResult = mask.querySelector('[data-credit-result]');
+      var creditData = null;
+      var creditReadSerial = 0;
+      var creditAccounts = [];
+      var creditBusy = false;
+      var creditJobId = '';
+      function selectedCreditAccounts() {
+        return creditAccounts.filter(function (a) { return !creditAccount.value || a.uid === creditAccount.value; });
+      }
+      function updateCreditAccounts() {
+        var previous = creditAccount.value;
+        creditAccount.innerHTML = '<option value="">全部账号</option>' + creditAccounts.map(function (a) { return '<option value="' + escAttr(a.uid) + '">' + esc(a.nickname || a.uid) + '</option>'; }).join('');
+        creditAccount.value = previous;
+        if (creditAccount.selectedIndex < 0) creditAccount.value = '';
+      }
+      function renderCredits() {
+        if (!creditData) return;
+        var selected = selectedCreditAccounts();
+        var ids = selected.map(function (a) { return a.uid; });
+        var byDay = Object.create(null), byAccount = Object.create(null), accountCalls = Object.create(null), total = 0, calls = 0;
+        (creditData.daily || []).forEach(function (item) {
+          if (ids.indexOf(item.uid) < 0) return;
+          var value = Number(item.used) || 0;
+          var day = byDay[item.date] || (byDay[item.date] = { used: 0, complete: 0 });
+          day.used += value; if (item.complete) day.complete++;
+          byAccount[item.uid] = (byAccount[item.uid] || 0) + value;
+          accountCalls[item.uid] = (accountCalls[item.uid] || 0) + (Number(item.count) || 0);
+          total += value; calls += Number(item.count) || 0;
+        });
+        var days = [], parts = creditData.from.split('-');
+        var date = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+        for (var i = 0; i < Number(creditDays.value); i++) {
+          var key = date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
+          days.push({ date: key, value: byDay[key] ? byDay[key].used : 0, known: !!byDay[key], complete: !!selected.length && !!byDay[key] && byDay[key].complete === selected.length });
+          date.setDate(date.getDate() + 1);
+        }
+        var max = Math.max.apply(null, days.map(function (d) { return d.value; }).concat([1]));
+
+        creditBody.innerHTML = '<div class="wbs-token-stats-grid wbs-credit-stats-grid"><div><span>积分消耗</span><strong>' + (creditData.daily.length ? esc(fmtCredits(total)) : '—') + '</strong></div><div><span>调用</span><strong>' + (creditData.daily.length ? esc(formatTokenCount(calls)) : '—') + '</strong></div></div>' +
+          '<div class="wbs-token-stats-section"><div class="wbs-token-stats-section-title">每日趋势</div><div class="wbs-credit-chart wbs-token-stats-chart">' + days.map(function (d) {
+            var label = d.complete ? fmtCredits(d.value) : d.known ? fmtCredits(d.value) + '*' : '—';
+            var hint = d.date + ' · ' + (d.complete ? fmtCredits(d.value) + ' 积分' : d.known ? fmtCredits(d.value) + (creditData.running ? ' 积分（部分日期加载中）' : ' 积分（部分账号查询失败）') : (creditData.running ? '日期数据加载中' : '查询失败，暂无数据'));
+            return '<div class="wbs-token-day wbs-credit-day" title="' + escAttr(hint) + '"><b>' + esc(label) + '</b><div class="wbs-credit-bar-track"><i style="height:' + (d.value ? Math.max(2, Math.round(d.value / max * 100)) : 0) + '%"></i></div><span>' + esc(d.date.slice(5)) + '</span></div>';
+          }).join('') + '</div>' + ((creditData.failures || []).length ? '<div class="wbs-credit-stats-note">* 表示部分账号查询失败；— 表示查询失败，暂无数据。</div>' : '') + '</div>' +
+          '<div class="wbs-token-stats-section"><div class="wbs-token-stats-section-title">账号用量</div><div class="wbs-token-model-scroll"><div class="wbs-token-stats-table">' + (selected.slice().filter(function (a) { return (byAccount[a.uid] || 0) > 0; }).sort(function (a,b) { return (byAccount[b.uid] || 0) - (byAccount[a.uid] || 0); }).map(function (a) { return '<div><span title="' + escAttr(a.nickname || a.uid) + '">' + esc(a.nickname || a.uid) + '</span><b>' + esc(fmtCredits(byAccount[a.uid])) + '</b><em>' + esc(formatTokenCount(accountCalls[a.uid] || 0)) + ' 次</em></div>'; }).join('') || '<div class="wbs-token-stats-empty">没有匹配的账号</div>') + '</div></div></div>';
+        var accountScroll = creditBody.querySelector('.wbs-token-model-scroll');
+        if (accountScroll) {
+          var syncAccountFade = function () {
+            accountScroll.classList.toggle('no-overflow', accountScroll.scrollHeight <= accountScroll.clientHeight + 1);
+            accountScroll.classList.toggle('at-end', accountScroll.scrollTop + accountScroll.clientHeight >= accountScroll.scrollHeight - 1);
+          };
+          accountScroll.addEventListener('scroll', syncAccountFade, { passive: true });
+          syncAccountFade();
+        }
+        var chart = creditBody.querySelector('.wbs-credit-chart');
+        if (chart) chart.scrollLeft = chart.scrollWidth;
+      }
+      function setCreditBusy(busy, showOverlay) {
+        creditBusy = busy;
+        if (!busy) creditBody.style.visibility = '';
+        creditSyncOverlay.hidden = !busy || !showOverlay;
+        creditDays.disabled = busy;
+        creditAccount.disabled = busy;
+        mask.querySelector('.wbs-credit-query-content').setAttribute('aria-busy', String(busy));
+      }
+      function creditQueryFailed(message) {
+        setCreditBusy(false);
+        creditData = null;
+        creditResult.hidden = false;
+        creditResult.textContent = message;
+        creditBody.innerHTML = '<div class="wbs-token-stats-empty">查询失败，请重新选择时间或账号重试</div>';
+      }
+      function showCreditJob(job) {
+        mask.querySelector('[data-credit-progress]').value = job.percent || 0;
+        mask.querySelector('[data-credit-progress-copy]').textContent = '已查询 ' + job.completed + '/' + job.total + ' 个账号 · ' + (job.percent || 0) + '%';
+        mask.querySelector('[data-credit-progress-detail]').textContent = job.current ? job.current + (job.pages ? ' · 第 ' + job.page + '/' + job.pages + ' 页 · 已读取 ' + job.records + ' 条记录' : ' · 正在连接…') : '';
+        setCreditBusy(job.running, !job.hasCachedData && !job.cacheHit);
+        creditData = job;
+        creditBody.style.visibility = '';
+        if (!job.hasCachedData && job.running) creditBody.innerHTML = '';
+        if (job.running) {
+          creditResult.hidden = true;
+          if (job.hasCachedData) renderCredits();
+        } else {
+          var failures = job.failures || [];
+          creditResult.hidden = !failures.length;
+          creditResult.textContent = failures.length
+            ? '查询成功 ' + job.synced + '/' + job.total + ' 个账号；结果不完整。' + failures.map(function (a) { return a.nickname + '：' + a.error; }).join('；') : '';
+          renderCredits();
+        }
+      }
+
+      function pollCreditJob(serial) {
+        creditPollTimer = null;
+        api('/api/credit-stats/sync').then(function (result) {
+          if (!mask.isConnected || serial !== creditReadSerial) return;
+          var job = result.job || {};
+          if (job.id !== creditJobId) { creditQueryFailed('查询已中断，请重新选择时间或账号重试'); return; }
+          showCreditJob(job);
+          if (job.running) creditPollTimer = setTimeout(function () { pollCreditJob(serial); }, 400);
+        }).catch(function () {
+          if (!mask.isConnected || serial !== creditReadSerial) return;
+          creditQueryFailed('无法读取查询进度，请重新选择时间或账号重试');
+        });
+      }
+      function loadCredits() {
+        if (creditBusy) return;
+        if (creditPollTimer) clearTimeout(creditPollTimer);
+        var serial = ++creditReadSerial;
+        creditLoaded = true; creditResult.textContent = ''; creditResult.hidden = true;
+        creditBody.style.visibility = 'hidden';
+        setCreditBusy(true, false);
+        mask.querySelector('[data-credit-progress]').removeAttribute('value');
+        mask.querySelector('[data-credit-progress-copy]').textContent = '正在连接…';
+        mask.querySelector('[data-credit-progress-detail]').textContent = '';
+        mask.querySelector('.wbs-usage-scroll').scrollTop = 0;
+        var request = { days: Number(creditDays.value) };
+        if (creditAccount.value) request.uids = [creditAccount.value];
+        api('/api/credit-stats', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request) }).then(function (result) {
+          if (!mask.isConnected || serial !== creditReadSerial) return;
+          creditAccounts = result.accounts || [];
+          updateCreditAccounts();
+          creditJobId = result.job.id;
+          showCreditJob(result.job);
+          if (result.job.running) pollCreditJob(serial);
+        }).catch(function (error) {
+          if (!mask.isConnected || serial !== creditReadSerial) return;
+          creditQueryFailed(error.message || '查询失败，请重新选择时间或账号重试');
+        });
+      }
+      mask.querySelectorAll('[data-usage-tab]').forEach(function (button) {
+        button.addEventListener('click', function () {
+          var tab = button.getAttribute('data-usage-tab');
+          var changed = !button.classList.contains('active');
+          mask.querySelectorAll('[data-usage-tab]').forEach(function (b) { b.classList.toggle('active', b === button); });
+          mask.querySelectorAll('[data-usage-pane]').forEach(function (pane) { pane.hidden = pane.getAttribute('data-usage-pane') !== tab; });
+          mask.querySelector('.wbs-usage-scroll').scrollTop = 0;
+          if (tab === 'credit' && (changed || !creditLoaded)) loadCredits();
+        });
+      });
+      creditDays.addEventListener('change', loadCredits);
+      creditAccount.addEventListener('change', loadCredits);
+      function load() {
+        for (var fi = 0; fi < filterControls.length; fi++) filterControls[fi].disabled = true;
+        overlay.hidden = false;
+        body.innerHTML = '<div class="wbs-token-stats-loading" role="status">正在读取 Token 用量…</div>';
+        if (firstLoadTimer) { clearTimeout(firstLoadTimer); firstLoadTimer = null; }
+        var loadingLabel = overlay.querySelector('span');
+        loadingLabel.hidden = true;
+        var query = '/api/token-stats?days=' + encodeURIComponent(daysSelect.value) + '&account=' + encodeURIComponent(accountSelect.value) + '&model=' + encodeURIComponent(modelSelect.value);
+        api('/api/token-stats?cacheStatus=1').then(function (metadata) {
+          if (!mask.isConnected) return null;
+          if (!metadata.cacheReady) {
+            overlay.hidden = false;
+            firstLoadTimer = setTimeout(function () { if (!overlay.hidden) loadingLabel.hidden = false; }, 350);
+          }
+          return api(query);
+        }).then(function (result) {
+          if (!result || !mask.isConnected) return;
+          var stats = result && result.stats || {};
+          loadingLabel.hidden = true;
+          var totals = stats.totals || {};
+          var previousAccount = accountSelect.value;
+          var previousModel = modelSelect.value;
+          loadedAccounts = (result && result.accounts) || stats.accounts || [];
+          accountSelect.innerHTML = '<option value="">全部账号</option>' + loadedAccounts.map(function (item) { var uid = item.uid || item.account || ''; var label = item.nickname || uid; return '<option value="' + escAttr(uid) + '">' + esc(label) + '</option>'; }).join('');
+          modelSelect.innerHTML = '<option value="">全部模型</option>' + (stats.models || []).map(function (item) { return '<option value="' + escAttr(item.model) + '">' + esc(item.model) + '</option>'; }).join('');
+          accountSelect.value = previousAccount;
+          modelSelect.value = previousModel;
+          var dailyByDate = Object.create(null);
+          (stats.daily || []).forEach(function (item) { dailyByDate[item.day] = item; });
+          var tokenDays = [], tokenDate = new Date(); tokenDate.setHours(0, 0, 0, 0); tokenDate.setDate(tokenDate.getDate() - (Number(daysSelect.value) - 1));
+          for (var dayIndex = 0; dayIndex < Number(daysSelect.value); dayIndex++) {
+            var dayKey = tokenDate.getFullYear() + '-' + String(tokenDate.getMonth() + 1).padStart(2, '0') + '-' + String(tokenDate.getDate()).padStart(2, '0');
+            tokenDays.push(dailyByDate[dayKey] || { day: dayKey, input: 0, output: 0 });
+            tokenDate.setDate(tokenDate.getDate() + 1);
+          }
+          var maxDay = Math.max.apply(null, tokenDays.map(function (item) { return (item.input || 0) + (item.output || 0); }).concat([1]));
+          var accountRows = (stats.accounts || []).filter(function (item) { return (item.input || 0) + (item.output || 0) + (item.cacheRead || 0) + (item.cacheWrite || 0) > 0; });
+          body.innerHTML = '<div class="wbs-token-stats-grid">' +
+            '<div><span>调用</span><strong>' + esc(formatTokenCount(totals.calls)) + '</strong></div>' +
+            '<div><span>输入</span><strong>' + esc(formatTokenCount(totals.input)) + '</strong></div>' +
+            '<div><span>输出</span><strong>' + esc(formatTokenCount(totals.output)) + '</strong></div>' +
+            '<div><span>缓存读取</span><strong>' + esc(formatTokenCount(totals.cacheRead)) + '</strong></div>' +
+            '<div><span>缓存写入</span><strong>' + esc(formatTokenCount(totals.cacheWrite)) + '</strong></div>' +
+            '</div><div class="wbs-token-stats-section"><div class="wbs-token-stats-section-title">每日趋势</div><div class="wbs-credit-chart wbs-token-stats-chart">' + tokenDays.map(function (item) { var value = (item.input || 0) + (item.output || 0); return '<div class="wbs-token-day wbs-credit-day"><b>' + esc(formatTokenCount(value)) + '</b><div class="wbs-credit-bar-track"><i style="height:' + (value ? Math.max(2, Math.round(value / maxDay * 100)) : 0) + '%" title="' + esc(formatTokenCount(value)) + '"></i></div><span>' + esc(String(item.day).slice(5)) + '</span></div>'; }).join('') + '</div></div>' +
+            '<div class="wbs-token-stats-section"><div class="wbs-token-stats-section-title">模型排行</div><div class="wbs-token-model-scroll"><div class="wbs-token-stats-table">' + ((stats.models || []).slice(0, 12).map(function (item) { return '<div><span>' + esc(item.model) + '</span><b>' + esc(formatTokenCount((item.input || 0) + (item.output || 0))) + '</b><em>' + esc(formatTokenCount(item.calls || 0)) + ' 次</em></div>'; }).join('') || '<div class="wbs-token-stats-empty wbs-token-empty-model">暂无模型数据</div>') + '</div></div></div>' +
+            '<div class="wbs-token-stats-section"><div class="wbs-token-stats-section-title">账号用量</div><div class="wbs-token-model-scroll"><div class="wbs-token-stats-table">' + (accountRows.map(function (item) { var label = item.nickname || item.account; var value = (item.input || 0) + (item.output || 0); return '<div><span title="' + escAttr(label) + '">' + esc(label) + '</span><b>' + esc(formatTokenCount(value)) + '</b><em>' + esc(formatTokenCount(item.calls || 0)) + ' 次</em></div>'; }).join('') || '<div class="wbs-token-stats-empty">暂无账号数据</div>') + '</div></div></div>';
+          var modelScroll = mask.querySelector('.wbs-token-model-scroll');
+          if (modelScroll) {
+            var syncModelFade = function () { modelScroll.classList.toggle('at-end', modelScroll.scrollTop + modelScroll.clientHeight >= modelScroll.scrollHeight - 1); modelScroll.classList.toggle('no-overflow', modelScroll.scrollHeight <= modelScroll.clientHeight + 1); };
+            modelScroll.addEventListener('scroll', syncModelFade, { passive: true });
+            syncModelFade();
+          }
+          hasStats = true;
+        }).catch(function (error) { if (hasStats) toast('读取失败：' + (error.message || error), true, root); else body.innerHTML = '<div class="wbs-token-stats-empty">读取失败：' + esc(error.message || error) + '</div>'; }).finally(function () { if (firstLoadTimer) { clearTimeout(firstLoadTimer); firstLoadTimer = null; } for (var fi = 0; fi < filterControls.length; fi++) filterControls[fi].disabled = false; overlay.hidden = true; });
+      }
+      for (var fi = 0; fi < filterControls.length; fi++) filterControls[fi].addEventListener('change', load);
+      load();
     }
 
     // ===== Tab 切换 =====
@@ -4608,8 +5414,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       for (var j = 0; j < panes.length; j++) panes[j].classList.toggle('active', panes[j].getAttribute('data-pane') === name);
       if (name === 'theme') {
         if (themePane && !themePane.dataset.built) buildThemePane();
-        var themeBtn = themePane && themePane.querySelector('.wbs-theme-opt.active');
-        syncWallpaperCardVisibility(themeBtn ? themeBtn.getAttribute('data-theme') : 'default');
+        var themeBtn = themePane && themePane.querySelector('#wbs-theme-seg .wbs-theme-opt.active');
+        syncWallpaperCardVisibility(themeBtn ? themeBtn.getAttribute('data-wbs-theme-option') : 'default');
       }
       if (name === 'sessions' && sessionsPane && !sessionsPane.dataset.built) buildSessionsPane();
       if (name === 'models' && modelsPane && !modelsPane.dataset.built) buildModelsPane();
@@ -4695,9 +5501,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           var active = running || stopping;
           var check = automationState.batchMode ? '<label class="wbs-auto-check"><input type="checkbox" data-auto-select="' + escAttr(task.id) + '"' + (automationState.selected[task.id] ? ' checked' : '') + '><span></span></label>' : '';
           var stateClass = active ? 'running' : !task.enabled && !task.manualRunnable ? 'off' : 'idle';
+          var builtinBadge = wbsIsBuiltinAutomation(task) ? '<span class="wbs-auto-builtin-badge">内置</span>' : '';
           var action = running ? '<button type="button" class="wbs-auto-icon is-running' + (stopping ? ' is-stopping' : '') + '" data-auto-stop="' + escAttr(run.id) + '" title="' + (stopping ? '正在停止…' : '停止本次执行') + '" aria-label="' + (stopping ? '正在停止…' : '停止本次执行') + '" aria-busy="true"' + (stopping ? ' disabled' : '') + '>' + (stopping ? AUTO_STOPPING_SVG : AUTO_STOP_SVG) + '</button>'
             : task.manualRunnable ? '<button type="button" class="wbs-auto-icon" data-auto-run="' + escAttr(task.id) + '" title="立即运行" aria-label="立即运行">' + MODEL_ENABLE_SVG + '</button>' : '';
-          row.innerHTML = '<div class="wbs-auto-row-head">' + check + '<div class="wbs-auto-name"' + (wbsBuiltinAutomationText(task, 'name') ? '' : ' data-wbs-i18n-skip="1"') + ' title="' + escAttr(task.name) + '">' + esc(task.name) + '</div>' +
+          row.innerHTML = '<div class="wbs-auto-row-head">' + check + builtinBadge + '<div class="wbs-auto-name"' + (wbsBuiltinAutomationText(task, 'name') ? '' : ' data-wbs-i18n-skip="1"') + ' title="' + escAttr(task.name) + '">' + esc(task.name) + '</div>' +
             '<label class="wbs-switch wbs-auto-enabled" title="' + (task.manualRunnable ? '手动任务无需自动触发' : '启用自动触发') + '"' + (task.manualRunnable || task.compatible === false ? ' hidden' : '') + '><input type="checkbox" data-auto-enabled="' + escAttr(task.id) + '" aria-label="启用自动触发"' + (task.enabled ? ' checked' : '') + '><span class="wbs-switch-slider"></span></label></div>' +
             (task.description ? '<div class="wbs-auto-description"' + (wbsBuiltinAutomationText(task, 'description') ? '' : ' data-wbs-i18n-skip="1"') + ' title="' + escAttr(task.description) + '">' + esc(task.description) + '</div>' : '') +
             '<div class="wbs-auto-row-foot"><div class="wbs-auto-details"><div class="wbs-auto-triggers" aria-label="触发方式">' + triggerBadgesHtml(task) + '</div><div class="wbs-auto-state-line"><span class="wbs-auto-state ' + stateClass + '">' + esc(taskStatusLabel(task, run, stopping)) + '</span>' +
@@ -4824,7 +5631,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var mask = document.createElement('div');
         mask.id = 'wbs-auto-editor-mask';
         mask.className = 'wbs-modal-mask wbs-modal-mask-panel';
-        mask.innerHTML = '<div class="wbs-modal wbs-auto-editor-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-auto-editor-title"><div class="wbs-auto-modal-head"><div class="wbs-modal-title" id="wbs-auto-editor-title">编辑任务</div><button class="wbs-auto-modal-close" type="button" title="关闭" aria-label="关闭"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 3l10 10M13 3 3 13"/></svg></button></div><div class="wbs-auto-editor-body"><label class="wbs-auto-field"><span>任务名称</span><input data-auto-field="name" type="text" maxlength="120"></label><label class="wbs-auto-field"><span>任务说明</span><textarea data-auto-field="description" rows="3" maxlength="500"></textarea></label><div class="wbs-auto-field"><span>事件触发（可多选）</span><div class="wbs-auto-trigger-options" data-auto-field="trigger" role="group" aria-label="触发方式"><label><input type="checkbox" value="pageReady"><span>页面就绪</span></label><label><input type="checkbox" value="pageLoaded"><span>页面加载</span></label><label><input type="checkbox" value="accountSwitched"><span>账号切换后</span></label><label><input type="checkbox" value="clientLoaded"><span>客户端加载</span></label><label><input type="checkbox" value="panelOpened"><span>打开面板</span></label></div><div class="wbs-auto-schedule"><label>定时方式 <select data-auto-field="scheduleType" aria-label="定时方式"><option value="manual">不定时</option><option value="interval">按间隔</option><option value="daily">每天</option><option value="weekly">每周</option><option value="monthly">每月</option><option value="once">指定时间一次</option></select></label><label data-schedule-for="interval">每 <input type="number" data-auto-field="intervalValue" min="1" max="10080" step="1" aria-label="间隔数值"><select data-auto-field="intervalUnit" aria-label="间隔单位"><option value="1">分钟</option><option value="60">小时</option><option value="1440">天</option></select></label><label data-schedule-for="monthly">日期 <input type="number" data-auto-field="monthDay" min="1" max="31" aria-label="每月日期"></label><label data-schedule-for="daily weekly monthly">时间 <input type="time" data-auto-field="time" aria-label="执行时间"></label><label data-schedule-for="once">日期时间 <input type="datetime-local" data-auto-field="onceAt" aria-label="执行日期和时间"></label><div class="wbs-auto-weekdays" data-schedule-for="weekly"><label><input type="checkbox" data-auto-weekday="1"><span>周一</span></label><label><input type="checkbox" data-auto-weekday="2"><span>周二</span></label><label><input type="checkbox" data-auto-weekday="3"><span>周三</span></label><label><input type="checkbox" data-auto-weekday="4"><span>周四</span></label><label><input type="checkbox" data-auto-weekday="5"><span>周五</span></label><label><input type="checkbox" data-auto-weekday="6"><span>周六</span></label><label><input type="checkbox" data-auto-weekday="0"><span>周日</span></label><button type="button" class="wbs-auto-textbtn" data-auto-workdays>工作日</button></div><div class="wbs-auto-schedule-hint" data-schedule-for="interval daily weekly monthly once">按电脑本地时间执行；错过不补跑，运行中跳过。</div><div class="wbs-auto-schedule-hint" data-schedule-for="monthly">当月没有该日期时跳过。</div></div></div><label class="wbs-auto-field wbs-auto-steps-field"><span>步骤 JSON</span><textarea data-auto-field="steps" spellcheck="false"></textarea></label></div><div class="wbs-modal-actions wbs-auto-editor-actions"><button class="wbs-modal-btn" type="button" id="wbs-auto-cancel">取消</button><button class="wbs-modal-btn wbs-modal-ok" type="button" id="wbs-auto-save">保存</button></div></div>';
+        mask.innerHTML = '<div class="wbs-modal wbs-auto-editor-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-auto-editor-title"><div class="wbs-auto-modal-head"><div class="wbs-modal-title" id="wbs-auto-editor-title">编辑任务</div><button class="wbs-auto-modal-close" type="button" title="关闭" aria-label="关闭"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 3l10 10M13 3 3 13"/></svg></button></div><div class="wbs-auto-editor-body"><label class="wbs-auto-field"><span>任务名称</span><input data-auto-field="name" type="text" maxlength="120"></label><label class="wbs-auto-field"><span>任务说明</span><textarea data-auto-field="description" rows="3" maxlength="500"></textarea></label><div class="wbs-auto-field"><span>事件触发（可多选）</span><div class="wbs-auto-trigger-options" data-auto-field="trigger" role="group" aria-label="触发方式"><label><input type="checkbox" value="pageReady"><span>页面就绪</span></label><label><input type="checkbox" value="pageLoaded"><span>页面加载</span></label><label><input type="checkbox" value="accountSwitched"><span>账号切换后</span></label><label><input type="checkbox" value="clientLoaded"><span>客户端加载</span></label><label><input type="checkbox" value="panelOpened"><span>打开面板</span></label></div><div class="wbs-auto-schedule"><label>定时方式 <select data-auto-field="scheduleType" aria-label="定时方式"><option value="manual">不定时</option><option value="interval">按间隔</option><option value="daily">每天</option><option value="weekly">每周</option><option value="monthly">每月</option><option value="once">指定时间一次</option></select></label><label data-schedule-for="interval">每 <input type="number" data-auto-field="intervalValue" min="1" max="10080" step="1" aria-label="间隔数值"><select data-auto-field="intervalUnit" aria-label="间隔单位"><option value="1">分钟</option><option value="60">小时</option><option value="1440">天</option></select></label><label data-schedule-for="monthly">日期 <input type="number" data-auto-field="monthDay" min="1" max="31" aria-label="每月日期"></label><label data-schedule-for="daily weekly monthly">时间 <input type="time" data-auto-field="time" aria-label="执行时间"></label><label data-schedule-for="once">日期时间 <input type="datetime-local" data-auto-field="onceAt" aria-label="执行日期和时间"></label><div class="wbs-auto-weekdays" data-schedule-for="weekly"><label><input type="checkbox" data-auto-weekday="1"><span>周一</span></label><label><input type="checkbox" data-auto-weekday="2"><span>周二</span></label><label><input type="checkbox" data-auto-weekday="3"><span>周三</span></label><label><input type="checkbox" data-auto-weekday="4"><span>周四</span></label><label><input type="checkbox" data-auto-weekday="5"><span>周五</span></label><label><input type="checkbox" data-auto-weekday="6"><span>周六</span></label><label><input type="checkbox" data-auto-weekday="0"><span>周日</span></label><button type="button" class="wbs-auto-textbtn" data-auto-workdays>工作日</button></div><div class="wbs-auto-schedule-hint" data-schedule-for="interval daily weekly monthly once">按电脑本地时间执行；错过不补跑，运行中跳过。</div><div class="wbs-auto-schedule-hint" data-schedule-for="monthly">当月没有该日期时跳过。</div></div></div><label class="wbs-auto-field wbs-auto-steps-field"><span>步骤 JSON</span><textarea data-auto-field="steps" spellcheck="false"></textarea></label></div><div class="wbs-modal-actions wbs-auto-editor-actions"><button class="wbs-modal-btn" type="button" id="wbs-auto-cancel">取消</button>' + (wbsIsBuiltinAutomation(task) ? '' : '<button class="wbs-modal-btn wbs-modal-ok" type="button" id="wbs-auto-save">保存</button>') + '</div></div>';
         (panel || root).appendChild(mask);
         var editor = mask.querySelector('.wbs-auto-editor-modal');
         automationState.editingId = task && task.id || null;
@@ -4852,7 +5659,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         editor.querySelector('[data-auto-field="steps"]').value = JSON.stringify(task ? task.steps : [], null, 2);
         mask.__wbsKeyHandler = function (event) { if (event.key === 'Escape') hideEditor(); };
         document.addEventListener('keydown', mask.__wbsKeyHandler, true);
-        mask.querySelector('#wbs-auto-save').addEventListener('click', saveEditor);
+        var saveButton = mask.querySelector('#wbs-auto-save');
+        if (saveButton) saveButton.addEventListener('click', saveEditor);
         mask.querySelector('#wbs-auto-cancel').addEventListener('click', hideEditor);
         mask.querySelector('.wbs-auto-modal-close').addEventListener('click', hideEditor);
         mask.addEventListener('click', function (event) { if (event.target === mask) hideEditor(); });
@@ -5128,14 +5936,15 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<button class="wbs-sess-bbtn" type="button" id="wbs-sess-copy" title="复制选中到其他账号"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span>复制</span></button>' +
         '<button class="wbs-sess-bbtn" type="button" id="wbs-sess-export" title="使用密码导出选中会话">' + EXPORT_ICON + '<span>导出</span></button>' +
         '<button class="wbs-sess-bbtn wbs-sess-delbtn" type="button" id="wbs-sess-delete" title="删除选中"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg><span>删除</span></button>' +
+        '<button class="wbs-sess-bbtn wbs-sess-delbtn" type="button" id="wbs-sess-delete-all" style="display:none" title="删除选中会话及所有账号的同源副本">' + TRASH_SVG + '<span>删除所有账号副本</span></button>' +
         '<button class="wbs-sess-bbtn wbs-sess-done" type="button" id="wbs-sess-done">取消</button>' +
         '</div>' +
         '</div>' +
-        '<input type="file" id="wbs-sess-import-file" accept=".json,application/json" style="display:none">' +
+        '<input type="file" id="wbs-sess-import-file" accept=".wds,.json,application/json,application/octet-stream" style="display:none">' +
         '<div class="wbs-sess-list" id="wbs-sess-list"></div>' +
         '</div>' +
         '<div class="wbs-modal-mask" id="wbs-sess-modal" style="display:none">' +
-        '<div class="wbs-modal">' +
+        '<div class="wbs-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-sess-modal-title">' +
         '<div class="wbs-modal-title" id="wbs-sess-modal-title">操作会话</div>' +
         '<div class="wbs-modal-body" id="wbs-sess-modal-body"></div>' +
         '<div class="wbs-modal-actions">' +
@@ -5464,9 +6273,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var cp = sessionsPane.querySelector('#wbs-sess-copy');
       var ex = sessionsPane.querySelector('#wbs-sess-export');
       var dl = sessionsPane.querySelector('#wbs-sess-delete');
+      var da = sessionsPane.querySelector('#wbs-sess-delete-all');
       if (cp) cp.style.display = n ? '' : 'none';
       if (ex) ex.style.display = n ? '' : 'none';
       if (dl) dl.style.display = n ? '' : 'none';
+      if (da) da.style.display = n ? '' : 'none';
       syncCheckAllBtn();
     }
     // 全选按钮：根据当前是否全选切换图标（勾选框 空/勾选 两种状态）与文案
@@ -5575,11 +6386,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           confirmText: '导出',
           hint: '将加密导出 ' + ids.length + ' 个会话及其本地消息附件。',
           onConfirm: function (password) { return api('/api/sessions/export', {
+            responseType: 'blob',
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ ids: ids, password: password }),
           }).then(function (result) {
-            downloadTransfer(result, 'WorkDaddy-sessions.json');
+            downloadTransfer(result, 'WorkDaddy-sessions-' + new Date().toISOString().slice(0, 10) + '.wds');
             toast('已导出 ' + result.count + ' 个会话（已加密）', false, root);
           }); },
         });
@@ -5592,7 +6404,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           var file = event.target && event.target.files && event.target.files[0];
           event.target.value = '';
           if (!file) return;
-          readTransferFile(file).then(function (content) {
+          file.slice(0, 8).text().then(function (magic) {
+            return magic === 'WDS4\r\n\x1a\n' ? file : readTransferFile(file);
+          }).then(function (content) {
             var targetUid = sessionsState.uid === '' ? '' : (sessionsState.uid || sessionsState.currentUid || '');
             var target = sessionsState.accounts.find(function (account) { return account.uid === targetUid; });
             openSecureTransferModal({
@@ -5601,11 +6415,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
               confirmText: '导入',
               keepOpenOnSuccess: true,
               hint: targetUid ? '会话将导入到「' + ((target && target.nickname) || '当前账号') + '」。' : '会话将保留导出时的账号归属。',
-              onConfirm: function (password) { return api('/api/sessions/import', {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ content: content, password: password, targetUid: targetUid }),
-              }).then(function (result) {
+              onConfirm: function (password) {
+                var binary = content === file;
+                var body;
+                if (binary) {
+                  var metadata = new TextEncoder().encode(JSON.stringify({ password: password, targetUid: targetUid }));
+                  var prefix = new Uint8Array(4);
+                  new DataView(prefix.buffer).setUint32(0, metadata.length);
+                  body = new Blob([prefix, metadata, file], { type: 'application/octet-stream' });
+                } else body = JSON.stringify({ content: content, password: password, targetUid: targetUid });
+                return api('/api/sessions/import', {
+                  method: 'POST',
+                  headers: { 'content-type': binary ? 'application/octet-stream' : 'application/json' },
+                  body: body,
+                }).then(function (result) {
                 var count = Number(result.count || (result.imported && result.imported.length) || 0);
                 var lines = ['导入完成：成功 ' + count + ' 个会话'];
                 if (result.failed) lines.push('失败：' + result.failed + ' 个');
@@ -5646,6 +6469,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           openDeleteModal(ids);
         });
       }
+      var delAllBtn = sessionsPane.querySelector('#wbs-sess-delete-all');
+      if (delAllBtn) {
+        delAllBtn.addEventListener('click', function () {
+          var ids = selectedSessIds();
+          if (!ids.length) { toast('请先勾选要删除的会话', true, root); return; }
+          openDeleteModal(ids, true);
+        });
+      }
       // 取消（退出批量模式，恢复工具栏右侧按钮）
       var doneBtn = sessionsPane.querySelector('#wbs-sess-done');
       if (doneBtn) {
@@ -5665,6 +6496,16 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var mask = sessionsPane.querySelector('#wbs-sess-modal');
       if (mask) {
         mask.addEventListener('click', function (e) { if (e.target === mask) showSessModal(false); });
+        mask.addEventListener('keydown', function (e) {
+          e.stopPropagation();
+          if (e.key === 'Escape') { e.preventDefault(); showSessModal(false); }
+          if (e.key === 'Tab') {
+            var controls = mask.querySelectorAll('button:not(:disabled),select:not(:disabled),input:not(:disabled)');
+            var first = controls[0], last = controls[controls.length - 1];
+            if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+            else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+          }
+        });
       }
     }
     // 迁移弹窗：选目标账号
@@ -5673,6 +6514,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var titleEl = sessionsPane.querySelector('#wbs-sess-modal-title');
       var body = sessionsPane.querySelector('#wbs-sess-modal-body');
       var okBtn = sessionsPane.querySelector('#wbs-sess-modal-ok');
+      okBtn.textContent = '确定';
+      okBtn.disabled = false;
       titleEl.textContent = '复制 ' + ids.length + ' 个会话到…';
       api('/api/accounts').then(function (d) {
         var accts = (d && d.accounts) || [];
@@ -5715,27 +6558,50 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       });
     }
     // 删除弹窗：确认框（真实删除，弹窗内警示不可恢复）
-    function openDeleteModal(ids) {
+    function openDeleteModal(ids, allAccounts) {
+      ids = ids.slice();
       var titleEl = sessionsPane.querySelector('#wbs-sess-modal-title');
       var body = sessionsPane.querySelector('#wbs-sess-modal-body');
       var okBtn = sessionsPane.querySelector('#wbs-sess-modal-ok');
-      titleEl.textContent = '删除 ' + ids.length + ' 个会话？';
-      body.innerHTML = '<div class="wbs-modal-warn">删除后会话将从列表中移除，本账号的会话与其自动复制到其他账号的同源副本（本地消息文件）都将被永久删除，此操作不可恢复。</div>';
+      var cancelBtn = sessionsPane.querySelector('#wbs-sess-modal-cancel');
+      var confirmed = !allAccounts;
+      var pending = false;
+      titleEl.textContent = allAccounts ? '删除所有账号的同源会话？' : '删除 ' + ids.length + ' 个会话？';
+      body.innerHTML = allAccounts
+        ? '<p>已选 ' + ids.length + ' 个会话</p><div class="wbs-modal-warn">将永久删除所选会话，以及已关联到其他账号的所有同源副本、消息文件和本地缓存。此操作不可恢复。</div>'
+        : '<div class="wbs-modal-warn">删除后会话将从列表中移除，本账号的会话与其自动复制到其他账号的同源副本（本地消息文件）都将被永久删除，此操作不可恢复。</div>';
+      okBtn.textContent = allAccounts ? '继续确认' : '确定';
+      okBtn.disabled = false;
       showSessModal(true);
-      okBtn.onclick = function () {
+      var submit = function () {
+        if (pending) return;
+        if (!confirmed) {
+          confirmed = true;
+          titleEl.textContent = '再次确认永久删除';
+          okBtn.textContent = '永久删除';
+          cancelBtn.focus();
+          return;
+        }
+        pending = true;
+        okBtn.disabled = true;
         api('/api/sessions/delete', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ ids: ids }),
         }).then(function (d) {
           var extra = (d && d.cascaded) ? '，含其他账号副本 ' + d.cascaded + ' 个' : '';
-          toast('已删除 ' + ((d && d.deleted) || ids.length) + ' 个会话' + extra, false, root);
-          showSessModal(false);
+          toast('已删除 ' + ((d && typeof d.deleted === 'number') ? d.deleted : ids.length) + ' 个会话' + extra, false, root);
+          if (okBtn.onclick === submit) showSessModal(false);
           loadSessions();
         }).catch(function (e) {
           toast('删除失败: ' + (e.message || e), true, root);
+        }).finally(function () {
+          pending = false;
+          if (okBtn.onclick === submit) okBtn.disabled = false;
         });
       };
+      okBtn.onclick = submit;
+      cancelBtn.focus();
     }
     function selectedSessIds() {
       return sessionsState.list.filter(function (s) { return sessionsState.selected[s.id]; }).map(function (s) { return s.id; });
@@ -5743,6 +6609,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function showSessModal(show) {
       var mask = sessionsPane.querySelector('#wbs-sess-modal');
       if (mask) mask.style.display = show ? '' : 'none';
+      if (!show) {
+        var okBtn = sessionsPane.querySelector('#wbs-sess-modal-ok');
+        if (okBtn) okBtn.onclick = null;
+      }
     }
 
     // ===== 模型 pane（当前模型 + WorkDaddy 本地备份） =====
@@ -5877,7 +6747,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             : (source.available ? '只导入当前不存在的模型，同名模型保留当前配置' : '未找到模型配置文件');
           var label = source.shared ? '模型配置已共用' : '从 ' + esc(source.name) + ' 导入';
           return '<button class="wbs-sess-bbtn wbs-model-import" type="button" data-model-import="' + escAttr(source.profileId) + '" title="' + escAttr(title) + '"' + disabled + '>' + label + '</button>';
-        }).join('');
+        }).join('') + '<span class="wbs-model-third-party"><button class="wbs-sess-bbtn" id="wbs-model-third-party" type="button" aria-haspopup="menu" aria-expanded="false">从第三方导入</button><span class="wbs-model-source-menu" id="wbs-model-source-menu" role="menu" style="display:none"><button type="button" role="menuitem" id="wbs-model-source-cc-switch">CC Switch</button></span></span>';
       }
       updateModelCounts();
       if (modelsState.tab === 'official') {
@@ -5925,8 +6795,168 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       mask.onclick = function (event) { if (event.target === mask) close(); };
       ok.onclick = function () { close(); onConfirm(); };
     }
+    function closeThirdPartyMenu() {
+      var menu = modelsPane.querySelector('#wbs-model-source-menu');
+      var button = modelsPane.querySelector('#wbs-model-third-party');
+      if (menu) menu.style.display = 'none';
+      if (button) button.setAttribute('aria-expanded', 'false');
+    }
+    function openThirdPartyModels(data) {
+      var prior = modelsPane.querySelector('#wbs-model-third-party-modal');
+      if (prior) prior.remove();
+      var mask = document.createElement('div');
+      mask.className = 'wbs-modal-mask';
+      mask.id = 'wbs-model-third-party-modal';
+      mask.innerHTML = '<div class="wbs-modal wbs-model-import-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-model-import-title"><div class="wbs-modal-title" id="wbs-model-import-title">从 CC Switch 导入模型</div><div class="wbs-modal-body"></div><div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" data-third-cancel>取消</button><button class="wbs-modal-btn wbs-modal-ok" type="button" data-third-ok>确定</button></div></div>';
+      modelsPane.appendChild(mask);
+      var body = mask.querySelector('.wbs-modal-body');
+      var title = mask.querySelector('.wbs-modal-title');
+      var ok = mask.querySelector('[data-third-ok]');
+      var cancel = mask.querySelector('[data-third-cancel]');
+      // The preview contains only importable models. It no longer has an available flag.
+      var rows = Array.isArray(data.models) ? data.models : [];
+      var groups = [];
+      rows.forEach(function (row) {
+        var key = row.providerKey || row.key;
+        var group = groups.find(function (item) { return item.key === key; });
+        if (!group) { group = { key: key, provider: row.provider || row.name, appType: row.appType, rows: [] }; groups.push(group); }
+        group.rows.push(row);
+      });
+      var appNames = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini', opencode: 'OpenCode', openclaw: 'OpenClaw' };
+      var apps = Object.keys(appNames).filter(function (app) { return groups.some(function (group) { return group.appType === app; }); });
+      var activeApp = apps[0] || '';
+      var visibleGroups = function () { return groups.filter(function (group) { return group.appType === activeApp; }); };
+      var chosen = {};
+      groups.forEach(function (group) { chosen[group.key] = true; });
+      var step = 'select', pending = false;
+      var selectedGroups = function () { return visibleGroups().filter(function (group) { return chosen[group.key]; }); };
+      var selectedIds = function () { return selectedGroups().reduce(function (ids, group) { return ids.concat(group.rows.map(function (row) { return row.key; })); }, []); };
+      var close = function () {
+        if (pending) return;
+        mask.remove();
+        var trigger = modelsPane.querySelector('#wbs-model-third-party');
+        if (trigger) trigger.focus();
+      };
+      var updateCount = function () {
+        var count = selectedGroups().length;
+        var all = body.querySelector('[data-third-all]');
+        var total = visibleGroups().length;
+        if (all) { all.checked = total > 0 && count === total; all.indeterminate = count > 0 && count < total; all.disabled = !total; }
+        var label = body.querySelector('[data-third-count]');
+        if (label) label.textContent = '已选 ' + count + ' / ' + total;
+        ok.disabled = !count;
+      };
+      body.innerHTML = '<div class="wbs-third-toolbar"><select class="wbs-sess-select" data-third-app aria-label="来源客户端">' + apps.map(function (app) { return '<option value="' + escAttr(app) + '">' + esc(appNames[app]) + '</option>'; }).join('') + '</select><label class="wbs-third-all"><input type="checkbox" data-third-all><span>全选</span><span data-third-count></span></label></div><div data-third-list></div>';
+      var renderGroups = function () {
+        var visible = visibleGroups();
+        body.querySelector('[data-third-list]').innerHTML = visible.length ? visible.map(function (group) {
+          var credentials = [];
+          group.rows.forEach(function (row) {
+            if (!credentials.some(function (item) { return item.url === row.url && item.apiKey === row.apiKey; })) credentials.push(row);
+          });
+          return '<label class="wbs-third-row"><input type="checkbox" data-third-key="' + escAttr(group.key) + '"' + (chosen[group.key] ? ' checked' : '') + '><span class="wbs-third-text"><strong>' + esc(group.provider || '未命名供应商') + '</strong><span>' + esc(group.rows.map(function (row) { return row.id; }).join(' / ')) + '</span>' + credentials.map(function (row) { return (row.url ? '<span>' + esc(row.url) + '</span>' : '') + (row.apiKey ? '<span>apiKey：' + esc(row.apiKey) + '</span>' : ''); }).join('') + '</span></label>';
+        }).join('') : '<div class="wbs-empty">未找到可导入的模型配置</div>';
+        updateCount();
+      };
+      renderGroups();
+      body.onchange = function (event) {
+        if (pending) return;
+        var input = event.target;
+        if (input.hasAttribute('data-third-app')) {
+          activeApp = input.value;
+          renderGroups();
+          return;
+        }
+        if (input.hasAttribute('data-third-all')) {
+          visibleGroups().forEach(function (group) { chosen[group.key] = input.checked; });
+          body.querySelectorAll('[data-third-key]').forEach(function (box) { box.checked = input.checked; });
+        } else if (input.hasAttribute('data-third-key')) chosen[input.getAttribute('data-third-key')] = input.checked;
+        updateCount();
+      };
+      cancel.onclick = close;
+      mask.addEventListener('click', function (event) { event.stopPropagation(); if (event.target === mask) close(); });
+      ['pointerdown', 'mousedown', 'keyup'].forEach(function (name) { mask.addEventListener(name, function (event) { event.stopPropagation(); }); });
+      mask.addEventListener('keydown', function (event) {
+        event.stopPropagation();
+        if (event.key === 'Escape') { event.preventDefault(); close(); }
+        if (event.key === 'Tab') {
+          var controls = Array.from(mask.querySelectorAll('button:not(:disabled),select:not(:disabled),input:not(:disabled)'));
+          var first = controls[0], last = controls[controls.length - 1];
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+          else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+        }
+      });
+      ok.onclick = function () {
+        if (pending) return;
+        var ids = selectedIds();
+        if (!ids.length) return;
+        pending = true;
+        ok.disabled = true;
+        cancel.disabled = true;
+        body.querySelectorAll('input,select').forEach(function (input) { input.disabled = true; });
+        ok.textContent = '导入中…';
+        api('/api/models/third-party/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ snapshot: data.snapshot, ids: ids, confirmed: step === 'confirm' }) })
+          .then(function (result) {
+            pending = false;
+            if (result.confirmationRequired) {
+              step = 'confirm';
+              mask.querySelector('.wbs-modal').classList.add('wbs-model-import-confirm');
+              title.textContent = '确认覆盖同名模型？';
+              body.onchange = null;
+              body.textContent = (result.replaced ? '将覆盖 ' + result.replaced + ' 个现有模型。' : '') +
+                (result.duplicateIds ? '所选配置中有 ' + result.duplicateIds + ' 个重复模型 ID，当前模型将采用最后一项。' : '') +
+                '导入前会自动备份，所选配置也会保存到「备选模型」。';
+              ok.disabled = false;
+              cancel.disabled = false;
+              ok.textContent = '确认导入';
+              cancel.focus();
+              return;
+            }
+            close();
+            toast('已导入 ' + result.imported + ' 个模型' + (result.replaced ? '，覆盖 ' + result.replaced + ' 个现有模型' : '') + '，所选配置已保存到「备选模型」', false, root);
+            loadModels();
+          }).catch(function (error) {
+            pending = false;
+            ok.disabled = false;
+            cancel.disabled = false;
+            body.querySelectorAll('input,select').forEach(function (input) { input.disabled = false; });
+            ok.textContent = step === 'confirm' ? '确认导入' : '确定';
+            toast(error.message || '导入失败，请重新读取模型列表', true, root);
+          });
+      };
+      cancel.focus();
+    }
     function wireModelsPane() {
+      listen(document, 'click', function (event) { if (!event.target.closest || !event.target.closest('.wbs-model-third-party')) closeThirdPartyMenu(); });
+      modelsPane.addEventListener('keydown', function (event) {
+        var menu = modelsPane.querySelector('#wbs-model-source-menu');
+        if (event.key === 'Escape' && menu && menu.style.display !== 'none') {
+          event.preventDefault(); event.stopPropagation(); closeThirdPartyMenu();
+          modelsPane.querySelector('#wbs-model-third-party').focus();
+        }
+      });
       modelsPane.addEventListener('click', function (event) {
+        var third = event.target.closest ? event.target.closest('#wbs-model-third-party') : null;
+        if (third && !third.disabled) {
+          var menu = modelsPane.querySelector('#wbs-model-source-menu');
+          if (menu.style.display !== 'none') { closeThirdPartyMenu(); return; }
+          third.disabled = true;
+          api('/api/models/third-party').then(function (result) {
+            if (!(result.sources || []).some(function (source) { return source.id === 'cc-switch'; })) { toast('未检测到 CC Switch 本地模型配置', true, root); return; }
+            menu.style.display = '';
+            third.setAttribute('aria-expanded', 'true');
+            menu.querySelector('button').focus();
+          }).catch(function (error) { toast(error.message || '读取第三方配置失败', true, root); }).finally(function () { third.disabled = false; });
+          return;
+        }
+        var cc = event.target.closest ? event.target.closest('#wbs-model-source-cc-switch') : null;
+        if (cc && !cc.disabled) {
+          closeThirdPartyMenu();
+          cc.disabled = true;
+          api('/api/models/third-party/preview', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source: 'cc-switch' }) })
+            .then(openThirdPartyModels).catch(function (error) { toast(error.message || '读取 CC Switch 模型失败', true, root); }).finally(function () { cc.disabled = false; });
+          return;
+        }
         var tab = event.target.closest ? event.target.closest('.wbs-model-tab') : null;
         if (tab) { modelsState.tab = tab.getAttribute('data-model-tab') || 'official'; modelsState.batch = false; modelsState.selected = {}; renderModels(); return; }
         var backup = event.target.closest ? event.target.closest('[data-model-backup]') : null;
@@ -6092,24 +7122,32 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<div class="wbs-pcard">' +
         '<div class="wbs-pcard-title">主题外观</div>' +
         '<div class="wbs-theme-seg" id="wbs-theme-seg">' +
-        '<button class="wbs-theme-opt active" type="button" data-theme="default">默认</button>' +
-        '<button class="wbs-theme-opt" type="button" data-theme="eye-care">护眼绿</button>' +
-        '<button class="wbs-theme-opt" type="button" data-theme="cyber-purple">赛博紫</button>' +
-        '<button class="wbs-theme-opt" type="button" data-theme="nebula">毛玻璃</button>' +
+        '<button class="wbs-theme-opt active" type="button" data-wbs-theme-option="default">浅色</button>' +
+        '<button class="wbs-theme-opt" type="button" data-wbs-theme-option="dark">深色</button>' +
+        '<button class="wbs-theme-opt" type="button" data-wbs-theme-option="eye-care">护眼绿</button>' +
+        '<button class="wbs-theme-opt" type="button" data-wbs-theme-option="cyber-purple">赛博紫</button>' +
+        '<button class="wbs-theme-opt" type="button" data-wbs-theme-option="nebula">毛玻璃</button>' +
         '</div>' +
         '</div>' +
         '<div class="wbs-pcard wbs-avatar-card">' +
         '<div class="wbs-pcard-title">头像</div>' +
         '<div class="wbs-avatar-row">' +
-        '<img class="wbs-avatar-preview" id="wbs-avatar-preview" alt="头像预览" title="点击恢复官方头像">' +
-        '<button class="wbs-theme-upload" id="wbs-avatar-upload" type="button" title="上传图片替换左下角头像">更换头像</button>' +
-        '<button class="wbs-theme-upload" id="wbs-avatar-reset" type="button" title="恢复 WorkBuddy 官方头像">恢复默认</button>' +
+        '<label class="wbs-avatar-option" title="WorkBuddy"><input type="radio" name="wbs-avatar-preset" value="workbuddy"><img data-avatar-image="workbuddy" alt="WorkBuddy"><span>WorkBuddy</span></label>' +
+        '<label class="wbs-avatar-option" title="WorkDaddy"><input type="radio" name="wbs-avatar-preset" value="workdaddy"><img data-avatar-image="workdaddy" alt="WorkDaddy"><span>WorkDaddy</span></label>' +
+        '<div class="wbs-avatar-custom-list" id="wbs-avatar-custom-list"></div>' +
+        '<button class="wbs-avatar-add" id="wbs-avatar-upload" type="button" title="添加头像" aria-label="添加头像"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>' +
         '<input type="file" id="wbs-avatar-file" accept="image/png,image/jpeg,image/webp" style="display:none">' +
         '</div>' +
         '</div>' +
         '<div class="wbs-pcard wbs-fab-settings">' +
+        '<div class="wbs-pcard-title">悬浮机器人</div>' +
+        '<div class="wbs-theme-seg wbs-robot-seg" role="radiogroup" aria-label="机器人外观">' +
+        '<label class="wbs-theme-opt wbs-robot-option" title="白底黑眼"><input type="radio" name="wbs-robot-style" value="white"><span>白色</span></label>' +
+        '<label class="wbs-theme-opt wbs-robot-option" title="黑底白眼"><input type="radio" name="wbs-robot-style" value="black"><span>黑色</span></label>' +
+        '<label class="wbs-theme-opt wbs-robot-option" title="毛玻璃底与镂空眼睛"><input type="radio" name="wbs-robot-style" value="glass"><span>毛玻璃</span></label>' +
+        '</div>' +
         '<div class="wbs-ask-row">' +
-        '<label class="wbs-ask-label" for="wbs-fab-auto-dock">机器人自动停靠<span class="wbs-ask-hint">闲置 5 秒后收起到窗口右侧，鼠标靠近边缘展开</span></label>' +
+        '<label class="wbs-ask-label" for="wbs-fab-auto-dock">自动贴边<span class="wbs-ask-hint">闲置 5 秒后收起，鼠标靠近即展开</span></label>' +
         '<label class="wbs-switch"><input type="checkbox" id="wbs-fab-auto-dock"><span class="wbs-switch-slider"></span></label>' +
         '</div></div>' +
         '<div class="wbs-pcard wbs-wallpaper-card" id="wbs-wallpaper-card" style="display:none">' +
@@ -6136,8 +7174,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<input type="range" id="wbs-bg-blur-range" min="0" max="100" step="1" value="0">' +
         '<span class="wbs-mask-val" id="wbs-bg-blur-val">0%</span>' +
         '</div>' +
-        '</div>';
+        '</div>' +
+        '<div class="wbs-pcard" id="wbs-text-shadow-card" style="display:none">' +
+        '<div class="wbs-ask-row">' +
+        '<label class="wbs-ask-label" for="wbs-text-shadow">消息文字阴影<span class="wbs-ask-hint">增强壁纸上的消息文字辨识度</span></label>' +
+        '<label class="wbs-switch"><input type="checkbox" id="wbs-text-shadow" checked disabled><span class="wbs-switch-slider"></span></label>' +
+        '</div></div>';
       wireThemePane();
+      applyAvatar();
     }
     // 增强 pane（构建：决策弹窗 + 开发者工具[默认隐藏，连点标题5次呼出]）
     function buildEnhancePane() {
@@ -6312,7 +7356,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           '<div class="wbs-update-bar" id="wbs-update-bar" style="display:none;height:6px;border-radius:3px;background:color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 22%,transparent);overflow:hidden;margin-top:8px"><i id="wbs-update-bar-fill" style="display:block;height:100%;width:0;border-radius:3px;background:var(--wb-button-primary-bg,#1f1f1f);transition:width .6s ease"></i></div>' +
         '</div>' +
         '<div class="wbs-pcard wbs-about-hero">' +
-          '<div class="wbs-about-name-row"><div class="wbs-about-name" id="wbs-about-name">' + WBS_BRAND + '</div><span class="wbs-about-ver" id="wbs-about-ver">' + esc('') + '</span></div>' +
+          '<div class="wbs-about-name-row"><span class="wbs-about-brand"><img class="wbs-about-logo" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDI0IiBoZWlnaHQ9IjEwMjQiIHZpZXdCb3g9IjAgMCAxMDI0IDEwMjQiIGZpbGw9Im5vbmUiPgogIDwhLS0gU3F1YXJlIG1hc3RlciwgYmFzZWQgb24gdGhlIHdlYnNpdGUncyBvcmlnaW5hbCBmbG9hdGluZyByb2JvdC4gLS0+CiAgPGRlZnM+CiAgICA8bGluZWFyR3JhZGllbnQgaWQ9ImJhY2tncm91bmQiIHgxPSIxNjAiIHkxPSIwIiB4Mj0iODkwIiB5Mj0iMTEwMCIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPgogICAgICA8c3RvcCBzdG9wLWNvbG9yPSIjMzQzNjNkIi8+PHN0b3Agb2Zmc2V0PSIuNSIgc3RvcC1jb2xvcj0iIzE3MTgxZCIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzA1MDUwNiIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0ic2hlbGwtc2lkZSIgeDE9IjQ5MCIgeTE9IjMxNSIgeDI9Ijg4NSIgeTI9IjkxMCIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPgogICAgICA8c3RvcCBzdG9wLWNvbG9yPSIjZTNlNmRhIi8+PHN0b3Agb2Zmc2V0PSIuNDgiIHN0b3AtY29sb3I9IiNiNWJkYWUiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiM4Yjk3ODUiLz4KICAgIDwvbGluZWFyR3JhZGllbnQ+CiAgICA8cmFkaWFsR3JhZGllbnQgaWQ9InNoZWxsIiBjeD0iMCIgY3k9IjAiIHI9IjEiIGdyYWRpZW50VHJhbnNmb3JtPSJ0cmFuc2xhdGUoMzAxIDM5MSkgcm90YXRlKDQ4KSBzY2FsZSg3NjIgOTA5KSIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPgogICAgICA8c3RvcCBzdG9wLWNvbG9yPSIjZmZmZWY3Ii8+PHN0b3Agb2Zmc2V0PSIuNDgiIHN0b3AtY29sb3I9IiNlZWVlZTkiLz48c3RvcCBvZmZzZXQ9Ii44MyIgc3RvcC1jb2xvcj0iI2RjZTBkNCIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iI2I3YzBhYyIvPgogICAgPC9yYWRpYWxHcmFkaWVudD4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0iYW50ZW5uYSIgeDE9IjQ2MSIgeTE9IjE1NyIgeDI9IjUwNiIgeTI9IjMxMiIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPgogICAgICA8c3RvcCBzdG9wLWNvbG9yPSIjZmZmZWY3Ii8+PHN0b3Agb2Zmc2V0PSIuNiIgc3RvcC1jb2xvcj0iI2VlZWVlOSIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iI2JhYzNiMCIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0iZXllcyIgeDE9IjI4MCIgeTE9IjQyMCIgeDI9IjU1OCIgeTI9IjYxMCIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPgogICAgICA8c3RvcCBzdG9wLWNvbG9yPSIjNDY1NDQzIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjNjg3MjY3Ii8+CiAgICA8L2xpbmVhckdyYWRpZW50PgogICAgPGxpbmVhckdyYWRpZW50IGlkPSJyaW0iIHgxPSIzMTEiIHkxPSIyOTUiIHgyPSI3OTYiIHkyPSI4NzgiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj4KICAgICAgPHN0b3Agc3RvcC1jb2xvcj0iI2ZmZiIgc3RvcC1vcGFjaXR5PSIuODUiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiNmZmYiIHN0b3Atb3BhY2l0eT0iLjA0Ii8+CiAgICA8L2xpbmVhckdyYWRpZW50PgogICAgPGZpbHRlciBpZD0icm9ib3Qtc2hhZG93IiB4PSItMzAlIiB5PSItMzAlIiB3aWR0aD0iMTcwJSIgaGVpZ2h0PSIxODAlIj4KICAgICAgPGZlRHJvcFNoYWRvdyBkeD0iOCIgZHk9IjI3IiBzdGREZXZpYXRpb249IjIyIiBmbG9vZC1jb2xvcj0iIzI0MzMxZiIgZmxvb2Qtb3BhY2l0eT0iLjI1Ii8+CiAgICA8L2ZpbHRlcj4KICA8L2RlZnM+CiAgPGRlZnM+PGNsaXBQYXRoIGlkPSJhcHAtbWFzayI+PHBhdGggZD0iTTM2MCAwSDY2NEM3OTAgMCA4NTMgMCA5MDEgMjRDOTQ0IDQ2IDk3OCA4MCAxMDAwIDEyM0MxMDI0IDE3MSAxMDI0IDIzNCAxMDI0IDM2MFY2NjRDMTAyNCA3OTAgMTAyNCA4NTMgMTAwMCA5MDFDOTc4IDk0NCA5NDQgOTc4IDkwMSAxMDAwQzg1MyAxMDI0IDc5MCAxMDI0IDY2NCAxMDI0SDM2MEMyMzQgMTAyNCAxNzEgMTAyNCAxMjMgMTAwMEM4MCA5NzggNDYgOTQ0IDI0IDkwMUMwIDg1MyAwIDc5MCAwIDY2NFYzNjBDMCAyMzQgMCAxNzEgMjQgMTIzQzQ2IDgwIDgwIDQ2IDEyMyAyNEMxNzEgMCAyMzQgMCAzNjAgMFoiLz48L2NsaXBQYXRoPjwvZGVmcz4KICA8ZyBjbGlwLXBhdGg9InVybCgjYXBwLW1hc2spIj4KICA8cmVjdCB3aWR0aD0iMTAyNCIgaGVpZ2h0PSIxMDI0IiBmaWxsPSJ1cmwoI2JhY2tncm91bmQpIi8+CiAgPCEtLSBLZWVwIHRoZSBjb21wYWN0IHJvdW5kZWQtc3F1YXJlIHNoZWxsLCBzaW5nbGUgYW50ZW5uYSwgYW5kIHR3byB1cHJpZ2h0IGV5ZXMuIC0tPgogIDxnIHRyYW5zZm9ybT0icm90YXRlKDggNTEyIDU0MCkiIGZpbHRlcj0idXJsKCNyb2JvdC1zaGFkb3cpIj4KICAgIDxyZWN0IHg9IjQ0OCIgeT0iMjAxIiB3aWR0aD0iNDciIGhlaWdodD0iMTI0IiByeD0iMjMuNSIgZmlsbD0idXJsKCNhbnRlbm5hKSIvPgogICAgPGNpcmNsZSBjeD0iNDcxLjUiIGN5PSIxODgiIHI9IjQyIiBmaWxsPSJ1cmwoI2FudGVubmEpIi8+CiAgICA8cmVjdCB4PSIxNTUiIHk9IjMxNCIgd2lkdGg9IjcyNSIgaGVpZ2h0PSI2MDQiIHJ4PSIxNTUiIGZpbGw9InVybCgjc2hlbGwtc2lkZSkiLz4KICAgIDxyZWN0IHg9IjExNiIgeT0iMjkyIiB3aWR0aD0iNzIwIiBoZWlnaHQ9IjYwNCIgcng9IjE1NCIgZmlsbD0idXJsKCNzaGVsbCkiLz4KICAgIDxyZWN0IHg9IjEyMCIgeT0iMjk2IiB3aWR0aD0iNzEyIiBoZWlnaHQ9IjU5NiIgcng9IjE1MCIgc3Ryb2tlPSJ1cmwoI3JpbSkiIHN0cm9rZS13aWR0aD0iOCIvPgogICAgPCEtLSBTaGlmdCB0aGUgb3JpZ2luYWwgZXllcyB1cCBhbmQgbGVmdCBpbnN0ZWFkIG9mIGNoYW5naW5nIHRoZSBjaGFyYWN0ZXIuIC0tPgogICAgPHJlY3QgeD0iMjU5IiB5PSI0MzAiIHdpZHRoPSI5OSIgaGVpZ2h0PSIxNTgiIHJ4PSI0OS41IiBmaWxsPSIjZmZmIiBmaWxsLW9wYWNpdHk9Ii42Ii8+CiAgICA8cmVjdCB4PSIyNTkiIHk9IjQyNSIgd2lkdGg9Ijk5IiBoZWlnaHQ9IjE1OCIgcng9IjQ5LjUiIGZpbGw9InVybCgjZXllcykiLz4KICAgIDxyZWN0IHg9IjQ2OSIgeT0iNDMwIiB3aWR0aD0iMTA4IiBoZWlnaHQ9IjE2MiIgcng9IjU0IiBmaWxsPSIjZmZmIiBmaWxsLW9wYWNpdHk9Ii42Ii8+CiAgICA8cmVjdCB4PSI0NjkiIHk9IjQyNSIgd2lkdGg9IjEwOCIgaGVpZ2h0PSIxNjIiIHJ4PSI1NCIgZmlsbD0idXJsKCNleWVzKSIvPgogIDwvZz4KICA8L2c+Cjwvc3ZnPgo=" alt="" width="32" height="32"><span class="wbs-about-name" id="wbs-about-name">' + WBS_BRAND + '</span></span><span class="wbs-about-ver" id="wbs-about-ver">' + esc('') + '</span></div>' +
           '<span class="wbs-about-badge" id="wbs-about-badge">本机回环 CDP 注入 · 不改官方安装包</span>' +
           '<div class="wbs-about-desc">一个基于 <b>Chrome DevTools Protocol (CDP)</b> 的 WorkBuddy 桌面端增强工具。零侵入、零重签名——只把界面组件注入到正在运行的 WorkBuddy 渲染进程里。</div>' +
           '<div class="wbs-about-support">' +
@@ -6337,7 +7381,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '</div>' +
         '<div class="wbs-pcard wbs-telemetry-card" id="wbs-telemetry-card">' +
           '<div class="wbs-telemetry-head">' +
-            '<div class="wbs-telemetry-label"><span class="wbs-pcard-title">发送错误诊断</span><span class="wbs-telemetry-help" tabindex="0" aria-label="查看错误诊断说明"><svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="8"/><path d="M8.4 7.6a1.8 1.8 0 1 1 2.8 1.45c-.75.48-1.2.85-1.2 1.75M10 13.7v.1"/></svg><span class="wbs-telemetry-tooltip" role="tooltip">仅发送经过脱敏、截断的版本、系统和错误信息，不包含账号、会话内容、Token 或 API Key；可随时关闭。</span></span></div>' +
+            '<div class="wbs-telemetry-label"><span class="wbs-pcard-title">发送错误诊断</span><span class="wbs-telemetry-help" tabindex="0" aria-label="查看错误诊断说明"><svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="8"/><path d="M8.4 7.6a1.8 1.8 0 1 1 2.8 1.45c-.75.48-1.2.85-1.2 1.75M10 13.7v.1"/></svg><span class="wbs-telemetry-tooltip" role="tooltip">此开关控制脱敏错误诊断。匿名安装数和日活独立统计（随机安装标识、系统、架构、版本、客户端类型及出口国家），不受此开关影响。不包含账号、会话内容、Token 或 API Key。</span></span></div>' +
             '<div class="wbs-telemetry-ctrl"><span class="wbs-telemetry-reco">推荐开启</span>' +
             '<label class="wbs-switch wbs-telemetry-switch" title="发送经过脱敏的错误诊断"><input type="checkbox" id="wbs-telemetry-switch" aria-label="发送错误诊断"><span class="wbs-switch-slider"></span></label>' +
             '</div>' +
@@ -6407,6 +7451,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var status = aboutPane.querySelector('#wbs-telemetry-status');
       if (!toggle || !status) return;
       function renderTelemetryState(enabled, managed) {
+        WBS_DIAGNOSTICS_ENABLED = !!enabled;
+        if (enabled) usageActivity.notify();
         toggle.checked = !!enabled;
         toggle.disabled = !managed;
         // 管理范围内：开关左侧固定展示「推荐开启」，不再显示已开启/已关闭动态文案
@@ -6739,11 +7785,39 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!card) return;
       var visible = themeId === 'nebula';
       card.style.display = visible ? '' : 'none';
+      var textCard = themePane.querySelector('#wbs-text-shadow-card');
+      if (textCard) textCard.style.display = visible ? '' : 'none';
       if (visible) loadWallpapers();
     }
 
     // 主题 pane 事件绑定（元素在 buildThemePane 之后才存在，延迟到首次切换时绑定）
     function wireThemePane() {
+      themePane.querySelectorAll('input[name="wbs-robot-style"]').forEach(function (input) {
+        input.checked = input.value === fabAppearance.get();
+        input.closest('.wbs-theme-opt').classList.toggle('active', input.checked);
+        input.addEventListener('change', function () {
+          if (input.checked) fabAppearance.set(input.value);
+          themePane.querySelectorAll('input[name="wbs-robot-style"]').forEach(function (radio) { radio.closest('.wbs-theme-opt').classList.toggle('active', radio.checked); });
+        });
+      });
+      var shadowSwitch = themePane.querySelector('#wbs-text-shadow');
+      if (shadowSwitch) {
+        shadowSwitch.addEventListener('change', function () {
+          var enabled = shadowSwitch.checked;
+          shadowSwitch.disabled = true;
+          api('/api/theme-text-shadow', {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: enabled }),
+          }).then(function (d) { shadowSwitch.checked = d.enabled; }).catch(function (e) {
+            shadowSwitch.checked = !enabled;
+            toast('文字阴影设置失败: ' + (e.message || e), true, root);
+          }).finally(function () { shadowSwitch.disabled = false; });
+        });
+        api('/api/theme-text-shadow').then(function (d) {
+          shadowSwitch.checked = d.enabled;
+        }).catch(function (e) {
+          toast('读取文字阴影失败: ' + (e.message || e), true, root);
+        }).finally(function () { shadowSwitch.disabled = false; });
+      }
       var dockSwitch = themePane.querySelector('#wbs-fab-auto-dock');
       if (dockSwitch) {
         dockSwitch.checked = fabQuietMode.isEnabled();
@@ -6752,19 +7826,19 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // 主题选择：segmented 按钮直接切换
       themePane.addEventListener('click', function (e) {
         var t = e.target;
-        var segBtn = t.closest ? t.closest('.wbs-theme-opt') : null;
+        var segBtn = t.closest ? t.closest('#wbs-theme-seg .wbs-theme-opt') : null;
         if (segBtn) {
-          var id = segBtn.getAttribute('data-theme');
+          var id = segBtn.getAttribute('data-wbs-theme-option');
           // 不做 active 拦截：即使当前已是该主题也强制重新应用（保证「切换到默认主题=强制浅色 / 切换到 WorkDaddy 主题=强制深色」始终生效，面板状态与真实主题不一致时也能纠正）
-          var previous = themePane.querySelector('.wbs-theme-opt.active');
-          themePane.querySelectorAll('.wbs-theme-opt').forEach(function (b) { b.classList.toggle('active', b === segBtn); });
+          var previous = themePane.querySelector('#wbs-theme-seg .wbs-theme-opt.active');
+          themePane.querySelectorAll('#wbs-theme-seg .wbs-theme-opt').forEach(function (b) { b.classList.toggle('active', b === segBtn); });
           syncWallpaperCardVisibility(id);
           applyTheme(id).then(function () {
-            var names = { 'default': '默认', 'nebula': WBS_BRAND + ' 主题', 'eye-care': '护眼绿', 'cyber-purple': '赛博紫' };
+            var names = { 'default': '浅色', 'dark': '深色', 'nebula': WBS_BRAND + ' 主题', 'eye-care': '护眼绿', 'cyber-purple': '赛博紫' };
             toast('已应用主题「' + (names[id] || id) + '」', false, root);
           }).catch(function (er) {
-            themePane.querySelectorAll('.wbs-theme-opt').forEach(function (b) { b.classList.toggle('active', b === previous); });
-            syncWallpaperCardVisibility(previous ? previous.getAttribute('data-theme') : 'default');
+            themePane.querySelectorAll('#wbs-theme-seg .wbs-theme-opt').forEach(function (b) { b.classList.toggle('active', b === previous); });
+            syncWallpaperCardVisibility(previous ? previous.getAttribute('data-wbs-theme-option') : 'default');
             toast('应用主题失败: ' + (er.message || er), true, root);
           });
           return;
@@ -6778,26 +7852,24 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         }
         var up = t.closest ? t.closest('#wbs-bg-upload, #wbs-theme-upload') : null;
         if (up) { var f = themePane.querySelector('#wbs-theme-file'); if (f) f.click(); return; }
+        var removeAvatar = t.closest ? t.closest('[data-avatar-delete]') : null;
+        if (removeAvatar) {
+          e.preventDefault();
+          try { avatarLibrary.remove(removeAvatar.getAttribute('data-avatar-delete')); applyAvatar(); }
+          catch (_) { toast('头像保存失败，请清理存储空间后重试', true, root); }
+          return;
+        }
         var av = t.closest ? t.closest('#wbs-avatar-upload') : null;
         if (av) { var af = themePane.querySelector('#wbs-avatar-file'); if (af) af.click(); return; }
-        var rs = t.closest ? t.closest('#wbs-avatar-reset') : null;
-        if (rs) {
-          try { localStorage.removeItem(AVATAR_KEY); } catch (_) {}
-          applyAvatar();
-          toast('已恢复官方头像', false, root);
-          return;
-        }
-        // 点击头像预览 = 应用官方头像
-        var pvEl = t.closest ? t.closest('#wbs-avatar-preview') : null;
-        if (pvEl) {
-          try { localStorage.removeItem(AVATAR_KEY); } catch (_) {}
-          applyAvatar();
-          toast('已应用官方头像', false, root);
-          return;
-        }
       });
       themePane.addEventListener('change', function (e) {
         var t = e.target;
+        if (t && t.name === 'wbs-avatar-preset') {
+          try { avatarLibrary.select(t.value); }
+          catch (_) { toast('头像保存失败，请清理存储空间后重试', true, root); }
+          applyAvatar();
+          return;
+        }
         if (t && t.id === 'wbs-theme-file') {
           var file = t.files && t.files[0];
           if (!file) return;
@@ -6819,15 +7891,18 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
                 c.width = 96; c.height = 96;
                 c.getContext('2d').drawImage(imgEl, (imgEl.width - size) / 2, (imgEl.height - size) / 2, size, size, 0, 0, 96, 96);
                 var dataUrl = c.toDataURL('image/webp', 0.85);
-                try { localStorage.setItem(AVATAR_KEY, dataUrl); } catch (_) {}
+                if (!alive) return;
+                avatarLibrary.add(dataUrl);
                 applyAvatar();
                 toast('头像已更新 ✓', false, root);
               } catch (e) {
-                toast('头像处理失败：' + String(e).slice(0, 50), true, root);
+                toast('头像保存失败，请清理存储空间后重试', true, root);
               }
             };
+            imgEl.onerror = function () { if (alive) toast('头像图片读取失败', true, root); };
             imgEl.src = reader2.result;
           };
+          reader2.onerror = function () { if (alive) toast('头像图片读取失败', true, root); };
           reader2.readAsDataURL(f2);
           t.value = '';
         }
@@ -7050,13 +8125,106 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       });
     }
 
+    var checkinRiskLoading = false;
+    var checkinRiskDone = false;
+    var checkinRiskClose = null;
+    registerDisposer(function () { if (checkinRiskClose) checkinRiskClose(); });
+
+    function showCheckinRiskOnOpen() {
+      if (!CAPS.accounts || CAPS.checkin === false || checkinRiskDone || checkinRiskLoading || checkinRiskClose) return;
+      checkinRiskLoading = true;
+      api('/api/automations/checkin-consent').then(function (result) {
+        if (!alive) return;
+        if (!result.shouldPrompt) { checkinRiskDone = true; return; }
+        if (!state.open) return;
+        var previousFocus = document.activeElement;
+        var mask = document.createElement('div');
+        mask.className = 'wbs-modal-mask wbs-modal-mask-panel wbs-checkin-risk-mask';
+        mask.innerHTML = '<div class="wbs-modal wbs-checkin-risk-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-checkin-risk-title" aria-describedby="wbs-checkin-risk-copy">' +
+          '<div class="wbs-modal-title" id="wbs-checkin-risk-title">自动签到提醒</div>' +
+          '<div class="wbs-modal-body" id="wbs-checkin-risk-copy"><p>开启后自动为已保存账号签到。</p>' +
+          '<p>请留意官方规则，自动操作可能影响账号使用。</p>' +
+          '<p>可随时在「自动化」中关闭。</p></div>' +
+          '<div class="wbs-checkin-risk-error" role="alert" hidden></div>' +
+          '<div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" data-checkin-choice="cancel">取消</button>' +
+          '<button class="wbs-modal-btn wbs-modal-ok" type="button" data-checkin-choice="enable">开启自动签到</button></div></div>';
+        var cancel = mask.querySelector('[data-checkin-choice="cancel"]');
+        var enable = mask.querySelector('[data-checkin-choice="enable"]');
+        var error = mask.querySelector('[role="alert"]');
+        var busy = false;
+        var closed = false;
+        function blockOutside(event) {
+          if (!mask.contains(event.target)) { event.preventDefault(); event.stopImmediatePropagation(); }
+        }
+        function keepFocus(event) {
+          if (!mask.contains(event.target)) { event.stopImmediatePropagation(); cancel.focus(); }
+        }
+        function keydown(event) {
+          if (event.key === 'Escape') {
+            event.preventDefault(); event.stopImmediatePropagation(); choose(false);
+          } else if (event.key === 'Tab') {
+            event.preventDefault(); event.stopImmediatePropagation();
+            if (busy) mask.querySelector('[role="dialog"]').focus();
+            else if (document.activeElement === cancel) enable.focus();
+            else if (document.activeElement === enable) cancel.focus();
+            else (event.shiftKey ? enable : cancel).focus();
+          } else blockOutside(event);
+        }
+        function close() {
+          if (closed) return;
+          closed = true;
+          ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'wheel', 'touchstart', 'touchmove'].forEach(function (type) {
+            document.removeEventListener(type, blockOutside, true);
+          });
+          document.removeEventListener('keydown', keydown, true);
+          document.removeEventListener('focusin', keepFocus, true);
+          mask.remove();
+          checkinRiskClose = null;
+          if (alive && state.open && previousFocus && previousFocus.isConnected) previousFocus.focus();
+        }
+        function choose(enabled) {
+          if (busy || closed) return;
+          busy = true; cancel.disabled = true; enable.disabled = true; error.hidden = true;
+          mask.querySelector('[role="dialog"]').focus();
+          api('/api/automations/checkin-consent', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: enabled }) }).then(function (result) {
+            if (!alive) return;
+            checkinRiskDone = true;
+            close();
+            if (result.enabled) window.dispatchEvent(new CustomEvent('workdaddy:accounts-updated'));
+          }).catch(function () {
+            if (closed || !alive) return;
+            busy = false; cancel.disabled = false; enable.disabled = false;
+            error.textContent = '保存失败，请重试。'; error.hidden = false;
+            cancel.focus();
+          });
+        }
+        mask.querySelector('[role="dialog"]').tabIndex = -1;
+        cancel.addEventListener('click', function () { choose(false); });
+        enable.addEventListener('click', function () { choose(true); });
+        ['click', 'dblclick', 'pointerdown', 'pointerup', 'mousedown', 'mouseup', 'keydown', 'keyup', 'keypress', 'wheel', 'touchstart', 'touchmove', 'contextmenu'].forEach(function (type) {
+          mask.addEventListener(type, function (event) { event.stopPropagation(); });
+        });
+        checkinRiskClose = close;
+        panel.appendChild(mask);
+        ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'wheel', 'touchstart', 'touchmove'].forEach(function (type) {
+          document.addEventListener(type, blockOutside, { capture: true, passive: false });
+        });
+        document.addEventListener('keydown', keydown, true);
+        document.addEventListener('focusin', keepFocus, true);
+        cancel.focus();
+      }).catch(function () {
+        // No acknowledgement on a failed read; retry at the next user opening.
+      }).finally(function () { checkinRiskLoading = false; });
+    }
+
     function setOpen(open, options) {
+      if (open && typeof closeRotationNotice === 'function') closeRotationNotice();
       if (open && window.__wbsAutomationInputActive) {
         toast('正在输入或切换账号，请稍后打开面板', false, root);
         return;
       }
       var newlyOpened = open && !state.open;
-      // 面板还不可见时应用最新到期顺序；本次打开期间只更新数值，不移动账号。
+      // 面板还不可见时应用最新到期顺序；首次加载/切换后的积分批次另行校正一次。
       if (newlyOpened && CAPS.accounts) {
         state.activityRetryUsed = false;
         sortAccountsByCreditExpiry();
@@ -7067,12 +8235,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       fab.classList.toggle('hidden', open); // 打开时隐藏按钮
       fabQuietMode.wake();
       if (open) {
+        if (newlyOpened && CAPS.accounts && !(options && options.automation)) showCheckinRiskOnOpen();
         if (newlyOpened && !(options && options.automation)) api('/api/automations/events', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'panelOpened' }) }).catch(function () {});
         refresh();
         checkForUpdate(); // 打开面板即检测更新（每次打开都强制查一次新版本）
         try { acCheckPromptOnOpen(); } catch (e) {} // 每次打开面板：指令块丢失则请求 daemon 补写（无 toast）
         try { syncSessionModule(); } catch (e) {} // 每次打开面板刷新会话模块（开关+快捷短语，含外部修改）
       } else {
+        if (typeof checkinRiskClose === 'function') checkinRiskClose();
         state.accountRefreshId = (state.accountRefreshId || 0) + 1;
         state.activityRunId++;
         state.creditRunId++;
@@ -7339,7 +8509,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // 主题 = CSS 变量覆盖（--wb-* / --dc-*），daemon 通过 CDP 注入 <style>。
     // 只提供四个入口：官方主题(default) 与 WorkDaddy 官方主题(nebula)、官方内置深色主题(eye-care/cyber-purple)
     // 默认选中「WorkBuddy 默认主题」(default)：未设置/异常时回退到 default 而非 nebula（用户要求）
-    var ALLOWED_THEMES = ['default', 'nebula', 'eye-care', 'cyber-purple'];
+    var ALLOWED_THEMES = ['default', 'dark', 'nebula', 'eye-care', 'cyber-purple'];
     function loadThemes() {
       api('/api/themes')
         .then(function (d) {
@@ -7347,7 +8517,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           if (!seg) return;
           var cur = d.current && ALLOWED_THEMES.indexOf(d.current) >= 0 ? d.current : 'default';
           seg.querySelectorAll('.wbs-theme-opt').forEach(function (b) {
-            b.classList.toggle('active', b.getAttribute('data-theme') === cur);
+            b.classList.toggle('active', b.getAttribute('data-wbs-theme-option') === cur);
           });
           syncWallpaperCardVisibility(cur);
           // 列表展示不能更改已保存的主题；主题只能由用户明确选择。
@@ -7365,8 +8535,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function themeSelectValue() {
       var seg = root.querySelector('.wbs-theme-seg');
       var act = seg ? seg.querySelector('.wbs-theme-opt.active') : null;
-      var id = act ? act.getAttribute('data-theme') : null;
-      return id && id !== 'default' ? id : 'nebula';
+      var id = act ? act.getAttribute('data-wbs-theme-option') : null;
+      return id && id !== 'default' && id !== 'dark' ? id : 'nebula';
     }
     // 页面主题由 daemon 在早期注入/加载时恢复；不要延迟 POST 旧主题，
     // 否则旧页面的异步请求可能覆盖用户刚选择的主题。
@@ -7377,22 +8547,24 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // 他人环境没有该文件 → 按钮点击时 __wbsStartPicked 不存在 → toast 报错即可，不影响其他功能。
     var piTitle = root.querySelector('#wbs-title');
     var piPickBtn = root.querySelector('#wbs-pick-btn');
-    var piClickCount = 0;
-    var piClickTimer = null;
     if (piTitle) {
-      piTitle.addEventListener('click', function () {
-        piClickCount += 1;
-        clearTimeout(piClickTimer);
-        piClickTimer = setBuildTimeout(function () { piClickCount = 0; }, 1200);
-        if (piClickCount >= 5) {
-          piClickCount = 0;
+      var brandClicks = createBrandClickAction({
+        setTimeout: setBuildTimeout, clearTimeout: function (id) { clearTimeout(id); },
+        openWebsite: function () {
+          api('/api/open-url', { method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ url: 'https://www.workdaddy.dev' })
+          }).catch(function (e) { toast('打开官网失败: ' + (e.message || e), true, root); });
+        },
+        unlockDebug: function () {
           hiddenToolsUnlocked = true;
           if (piPickBtn) piPickBtn.style.display = '';
           var monitorLogCard = aboutPane && aboutPane.querySelector('#wbs-monitor-log-card');
           if (monitorLogCard) monitorLogCard.style.display = '';
           try { toast('隐藏工具已呼出', false, root); } catch (_) {}
-        }
+        },
       });
+      listen(piTitle, 'click', function (event) { event.preventDefault(); brandClicks.click(); });
+      registerDisposer(brandClicks.destroy);
     }
     if (piPickBtn) {
       piPickBtn.addEventListener('click', function () {
@@ -7405,8 +8577,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     // ===== 头像（官方 footer-brand-logo SVG / 自定义上传，localStorage 持久化，定时保持）=====
-    var AVATAR_KEY = 'wbsAvatar';
-    // WorkBuddy 官方品牌 logo（footer-brand-logo），作为「官方头像」预览/选择/恢复默认的目标
+    var avatarLibrary = createAvatarLibrary({
+      getItem: function (key) { return localStorage.getItem(key); },
+      setItem: function (key, value) { localStorage.setItem(key, value); },
+      removeItem: function (key) { localStorage.removeItem(key); },
+    });
+    // WorkBuddy 官方品牌 logo（footer-brand-logo），作为 WorkBuddy 预设头像
     var OFFICIAL_LOGO_SVG =
       '<svg xmlns="http://www.w3.org/2000/svg" width="161" height="161" viewBox="0 0 161 161" fill="none">' +
       '<g clip-path="url(#c0)">' +
@@ -7464,13 +8640,30 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       applyAvatar();
     });
     function applyAvatar() {
-      var dataUrl = null;
-      try { dataUrl = localStorage.getItem(AVATAR_KEY); } catch (_) {}
-      var pv = root.querySelector('#wbs-avatar-preview');
+      if (!avatarLibrary) return;
+      var saved = avatarLibrary.snapshot();
+      var customList = root.querySelector('#wbs-avatar-custom-list');
+      if (customList) {
+        var signature = saved.items.map(function (item) { return item.id; }).join(',');
+        if (customList.getAttribute('data-items') !== signature) {
+          customList.innerHTML = saved.items.map(function (item) {
+            return '<div class="wbs-avatar-custom"><label class="wbs-avatar-option" title="自定义头像"><input type="radio" name="wbs-avatar-preset" value="' + escAttr(item.id) + '"><img data-avatar-image="' + escAttr(item.id) + '" src="' + escAttr(item.src) + '" alt="自定义头像"><span>自定义</span></label>' +
+              '<button class="wbs-avatar-delete" type="button" data-avatar-delete="' + escAttr(item.id) + '" title="删除头像" aria-label="删除头像"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></svg></button></div>';
+          }).join('');
+          customList.setAttribute('data-items', signature);
+        }
+      }
+      var selected = saved.items.find(function (item) { return item.id === saved.selected; });
+      var choice = resolveAvatarChoice(selected ? selected.src : saved.selected, OFFICIAL_AVATAR, WBS_AVATAR_LOGO);
+      var target = choice.src;
       var wrap = document.querySelector('.user-menu-trigger-avatar');
-      // 目标头像：自定义 or 官方 logo
-      var target = dataUrl || OFFICIAL_AVATAR;
-      if (wrap) {
+      root.querySelectorAll('input[name="wbs-avatar-preset"]').forEach(function (input) {
+        input.checked = input.value === saved.selected;
+        var image = input.parentNode.querySelector('img');
+        var src = input.value === 'workbuddy' ? OFFICIAL_AVATAR : input.value === 'workdaddy' ? WBS_AVATAR_LOGO : null;
+        if (src && image.getAttribute('src') !== src) image.src = src;
+      });
+      if (wrap && target) {
         rememberAvatarWrapper(wrap);
         // 官方默认头像图片改用 visibility:hidden（保留占位与布局，仅不可见）：
         // 不能 display:none——头像容器尺寸由这张 img 撑开，display:none 会让容器塌陷成 0×0，
@@ -7505,11 +8698,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           var app2 = wrap.querySelector('img[data-wbs-avatar-app]');
           if (app2) app2.remove();
         }
-      }
-      // 面板内头像预览（始终显示：官方 logo 或自定义）
-      if (pv) {
-        if (target) { pv.setAttribute('src', target); pv.style.display = 'block'; }
-        else { pv.style.display = 'none'; pv.removeAttribute('src'); }
       }
     }
     // 头像上传按钮/文件输入位于主题 pane（构建后由 wireThemePane 事件委托处理）
@@ -8592,6 +9780,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (c.judgedMessages.has(signature)) return;
       var idleFor = Date.now() - c.controllerIdleAt;
       var controllerCompleted = autoContinueControllerCompleted(snap);
+      // A completed flag can appear when the assistant row is created, before
+      // its reply text arrives. Account rotation must wait for an actual reply.
+      if (controllerCompleted && !String(snap.text || '').trim()) {
+        acScheduleSettle(350);
+        return;
+      }
       // 明确 terminal（或旧版无 terminal 字段时的 complete）是可靠终局，可立即判定；错误也只需短缓冲；
       // 其余 incomplete 空闲等待 8 秒，避免 state 与最后一个消息 chunk 存在极短时序差。
       if (!controllerCompleted && !snap.error && idleFor < AC_CONTROLLER_SETTLE_MS) {
@@ -8612,6 +9806,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       c.judgedMessages.add(signature);
       if (!decision.trigger) {
         acLog('controller-completed', { id: snap.assistantId, reason: decision.reason, complete: snap.complete, terminal: snap.terminal });
+        if (controllerCompleted) checkCreditRotationAfterSession();
         return;
       }
       if (snap.manualStop) { acLog('controller-user-cancelled-skip', { id: snap.assistantId }); return; }
@@ -9210,6 +10405,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (session.judgedMessages.has(signature)) return;
       var idleFor = Date.now() - session.idleAt;
       var completed = autoContinueControllerCompleted(snapshot);
+      if (completed && !String(snapshot.text || '').trim()) {
+        acMultiSchedule(session, 350);
+        return;
+      }
       if (!completed && !snapshot.error && idleFor < AC_CONTROLLER_SETTLE_MS) {
         acMultiUpdateStatus(session, 'settling', { idleForMs: idleFor });
         acMultiSchedule(session, Math.max(250, AC_CONTROLLER_SETTLE_MS - idleFor));
@@ -9228,6 +10427,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       session.judgedMessages.add(signature);
       if (!decision.trigger) {
         acMultiFinishSession(session);
+        if (completed && !session.rotationNotified) {
+          session.rotationNotified = true;
+          checkCreditRotationAfterSession();
+        }
         return;
       }
       if (snapshot.manualStop) {
@@ -9959,6 +11162,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
     // reinject/刷新时销毁监控，避免叠加 observer/timer
     registerDisposer(function () {
+      closeRotationNotice();
       acRunning = false;
       if (acThemeObserver) { try { acThemeObserver.disconnect(); } catch (e) {} acThemeObserver = null; }
       acStopMonitor();
@@ -10033,17 +11237,24 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     //     它们只有「确认/始终允许/拒绝」，没有独立「允许」选项，天然不命中）。
     //  注意（1.0.16）：WorkBuddy AI 拦截卡选项按钮文本带序号前缀（如「1允许」「2本次会话内始终允许」），
     //  once 匹配必须先规范化（去序号）；文件拦截文案是「检测到受保护文件修改」等，已补进关键词表。
-    var ND_CONFIRM_PATTERN = /批量删除|沙箱|越界|越权|系统级工具|系统工具|权限|允许访问|将运行|需要你确认|需要你的确认|确认允许|检测到|受保护|敏感|凭据|黑名单|sandbox|approval|permission/i;
-    var ND_CREDIT_PATTERN = /积分|信用|credit|消耗|付费|支付|费用|金额|余额|扣费/i;
-    var ND_DENY_WORD = /拒绝|Deny/i;
-    var ND_ONCE_LABEL = /^(允许|允许一次|Allow|Yes|同意|批准|确认允许)$/i;
+    //  注意（WorkBuddy 5.5.4）：敏感凭据路径不再走沙箱拦截卡，而走独立的
+    //  「敏感凭证保护」卡（interceptType=sensitive-protection），其允许选项文案是
+    //  「允许访问」/「允许加密访问（推荐）」，且 ingress-protect-only 场景下只有后者——
+    //  旧规则只认精确的「允许」，这类卡会一直挂着不点。文案表已补齐（见 ND_ALLOW_ONCE_LABELS）。
+    //  该卡同样是 <button> + 序号 span + 文案 span，结构与沙箱拦截卡一致，无需额外选择器适配。
+    // 文案表统一取自顶层常量（ND_*_HINTS / ND_ALLOW_*_LABELS），此处只做局部别名，
+    // 避免扫描逻辑与纯函数判定各写一份正则后再次漂移。
+    var ND_CONFIRM_PATTERN = ND_CONFIRM_HINTS;
+    var ND_CREDIT_PATTERN = ND_CREDIT_HINTS;
+    var ND_DENY_WORD = ND_DENY_HINTS;
+    var ND_ONCE_LABEL = ND_ALLOW_ONCE_LABELS;
     function ndNormalizeLabel(t) {
       return String(t || '').trim().replace(/^\d+\s*/g, '');
     }
     // 容器是否构成「允许+拒绝」决策组：含 ≥2 个按钮，且其中一个是精确 once 允许选项
     function ndIsDecisionGroup(box) {
       var opts = box.querySelectorAll('button');
-      if (!opts || opts.length < 2 || opts.length > 12) return false;
+      if (!opts || opts.length < 2 || opts.length > ND_MAX_DECISION_BUTTONS) return false;
       for (var i = 0; i < opts.length; i++) {
         if (ND_ONCE_LABEL.test(ndNormalizeLabel(opts[i].textContent || ''))) return true;
       }
@@ -10053,12 +11264,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (typeof classifyNoDisturbApprovalCandidate === 'function') return classifyNoDisturbApprovalCandidate(value);
       var input = value || {};
       var label = String(input.label || '').trim().replace(/^\d+\s*/, '');
-      var kind = /始终允许|Always\s*allow/i.test(label) ? 'session' :
-        (/^(允许|允许一次|Allow|Yes|同意|批准|确认允许)$/i.test(label) || (/^Yes/i.test(label) && label.length < 24) ? 'once' : null);
+      var kind = ND_ALLOW_SESSION_LABELS.test(label) ? 'session' :
+        (ND_ALLOW_ONCE_LABELS.test(label) || (/^Yes/i.test(label) && label.length < 24) ? 'once' : null);
       if (!kind || input.disabled || input.ariaDisabled) return null;
       var context = String(input.context || '').slice(0, 700);
       if (input.creditSeen || ND_CREDIT_PATTERN.test(context)) return null;
-      return ND_CONFIRM_PATTERN.test(context) || (input.hasDeny === true && input.hasOnce === true && input.buttonCount >= 2 && input.buttonCount <= 12) ? kind : null;
+      return ND_CONFIRM_PATTERN.test(context) || (input.hasDeny === true && input.hasOnce === true && input.buttonCount >= 2 && input.buttonCount <= ND_MAX_DECISION_BUTTONS) ? kind : null;
     }
     function ndSessionIdForNode(node) {
       try {
@@ -10072,24 +11283,21 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var hasDeny = false;
       var count = 0;
       var creditSeen = false;
-      var creditBox = button;
-      for (var creditDepth = 0; creditDepth < 8 && creditBox; creditDepth++) {
-        creditBox = creditBox.parentElement;
-        if (creditBox && ND_CREDIT_PATTERN.test(String(creditBox.textContent || '').slice(0, 700))) {
-          creditSeen = true;
-          break;
-        }
-      }
       for (var depth = 0; depth < 8 && box; depth++) {
         box = box.parentElement;
         if (!box) break;
+        var buttons = box.querySelectorAll('button');
+        count = buttons ? buttons.length : 0;
+        // 逃出卡片就停：祖先容器（消息列表 / BODY）按钮数量必然远超卡片量级。
+        // 必须停，否则：① 祖先文本前 700 字里出现「积分/费用/金额」等词，会把整个候选
+        // 误判成扣费弹窗而永不点击（历史故障：弹窗一个都点不动）；② 关键词命中变成
+        // 「整段会话开头恰好含关键词」的碰运气。
+        if (count > ND_MAX_DECISION_BUTTONS) break;
         var current = String(box.textContent || '');
         if (current.length > 700) current = current.slice(0, 700);
         text = current;
         if (ND_CREDIT_PATTERN.test(current)) creditSeen = true;
         hasDeny = ND_DENY_WORD.test(current);
-        var buttons = box.querySelectorAll('button');
-        count = buttons ? buttons.length : 0;
         var hasOnce = ndIsDecisionGroup(box);
         var kind = ndClassifyApprovalCandidate({
           label: button.textContent || '',
@@ -10336,17 +11544,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       return '剩余 ' + Math.ceil(diff / day) + ' 天';
     }
 
-    function creditTone(ts) {
-      var day = 24 * 3600 * 1000;
-      if (!ts || Number(ts) - Date.now() > 30 * day) return 'safe';
-      var diff = Number(ts) - Date.now();
-      if (diff <= day) return 'within1';
-      if (diff <= 3 * day) return 'within3';
-      if (diff <= 7 * day) return 'within7';
-      if (diff <= 15 * day) return 'within15';
-      return 'within30';
-    }
-
     function creditTip(segment) {
       var amount = fmtCredits(segment.remaining) + ' 积分';
       var source = segment.source === 'meter' ? '基础用量'
@@ -10371,7 +11568,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var weight = Math.max(0.008, amount / total);
         var tip = creditTip(segment);
         var attrTip = esc(tip).replace(/"/g, '&quot;');
-        return '<span class="wbs-credit-segment ' + creditTone(segment.expiresAt) + '" style="flex:' + weight.toFixed(4) + ' 1 0" data-tip="' + attrTip + '" aria-label="' + attrTip + '"></span>';
+        return '<span class="wbs-credit-segment" style="--wbs-credit-alpha:' + creditOpacity(segment.expiresAt ? (Number(segment.expiresAt) - Date.now()) / 86400000 : null).toFixed(5) + ';flex:' + weight.toFixed(4) + ' 1 0" data-tip="' + attrTip + '" aria-label="' + attrTip + '"></span>';
       }).join('');
       return '<div class="wbs-credit-bar" role="img" aria-label="积分到期分布">' + cells + '</div>';
     }
@@ -10436,7 +11633,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           expiresAt: nearestCreditExpiry(account),
         };
       }).sort(function (a, b) {
-        // 不再置顶当前账号：统一按积分到期时间升序（最近到期最前），无到期信息排最后
+        if (state.accountOrder && state.accountOrder.mode === 'fixed') {
+          var left = Number(a.account.sort) > 0 ? Number(a.account.sort) : Infinity;
+          var right = Number(b.account.sort) > 0 ? Number(b.account.sort) : Infinity;
+          return left === right ? a.index - b.index : left - right;
+        }
+        // 按积分到期时间升序，无到期信息排最后
         if (a.expiresAt !== b.expiresAt) return a.expiresAt - b.expiresAt;
         return a.index - b.index;
       }).map(function (item) { return item.account; });
@@ -10478,9 +11680,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function accountCardLayoutKey() {
       // 积分/签到刷新不应重建切换按钮，保留焦点和两击确认状态。
       var rows = state.accounts.map(function (a) {
-        return [a.uid, a.nickname, a.phone, a.uin, a.type, a.enterpriseName, a.tokenExpiresAt, isIdentityExpired(a)];
+        return [a.uid, a.nickname, a.phone, a.uin, a.type, a.enterpriseName, a.tokenExpiresAt, a.authValid, isIdentityExpired(a)];
       }).sort(function (a, b) { return String(a[0]).localeCompare(String(b[0])); });
-      return JSON.stringify([state.current && state.current.uid, state.primaryUid, rows]);
+      return JSON.stringify([state.current && state.current.uid, rows]);
     }
 
     function pollAutoCopyJob(jobId, accountName) {
@@ -10523,15 +11725,21 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
     function render(data) {
       var previous = state.accounts;
+      var currentChanged = previous.length > 0 && (state.current && state.current.uid) !== (data.current && data.current.uid);
       state.current = data.current;
       state.accounts = mergeAccountSnapshot(previous, data.accounts || []);
-      state.primaryUid = data.primaryUid || '';
-      if (!previous.length || !state.open) sortAccountsByCreditExpiry();
+      state.accountOrder = data.accountOrder || state.accountOrder || { mode: 'expiry' };
+      // 页面重载后还没有积分缓存，或刚切换账号：等本轮积分齐备后校正一次顺序。
+      if (currentChanged || (!previous.length && state.accounts.some(function (account) { return !Array.isArray(account.creditSegments); }))) {
+        state.accountSortPending = true;
+      }
+      if (!previous.length || !state.open || currentChanged) sortAccountsByCreditExpiry();
       state.creditRemaining = state.accounts.length;
       updateAccountSummary();
       var list = accountsPane.querySelector('.wbs-acct-list');
       var layoutKey = accountCardLayoutKey();
       if (list && state.accountLayoutKey === layoutKey) {
+        if (!state.open) reorderAccountCards();
         updateCheckinCells(state.accounts);
         state.accounts.forEach(function (account) { updateCreditCell(account.uid, account.credits, account.creditSegments); });
         return;
@@ -10552,17 +11760,15 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         // 版本标签：个人账号显示「个人版」；企业账号显示企业名称（enterpriseName），缺省回退「企业」。
         var editionBadge = a.type === 'personal' ? '个人版' : (a.enterpriseName ? a.enterpriseName : (a.type ? '企业' : ''));
         var badge = editionBadge ? '<span class="wbs-badge">' + esc(editionBadge) + '</span>' : '';
-        var isPrimary = a.uid === state.primaryUid;
-        var primaryBadge = isPrimary ? '<span class="wbs-primary-mark" role="img" aria-label="主账号" title="主账号">' + PRIMARY_ACCOUNT_SVG + '</span>' : '';
-        var primaryAction = '<button class="wbs-icon-btn wbs-set-primary" type="button" data-primary-uid="' + escAttr(a.uid) + '" title="设为主账号" aria-label="设为主账号"' + (isPrimary ? ' hidden' : '') + '>' + PRIMARY_ACCOUNT_SVG + '</button>';
         var checkinBadge = checkinBadgeHtml(a);
+        var invalidAuthBadge = a.authValid === false ? '<span class="wbs-badge wbs-auth-invalid">认证数据无效</span>' : '';
         // 当前登录账号隐藏操作；认证已过期的账号保留删除，但隐藏切换，避免进入登录页。
         var expired = isIdentityExpired(a);
-        var ops = primaryAction + (isCur
+        var ops = (isCur
           ? ''
-          : (expired ? '' : '<button class="wbs-icon-btn wbs-acc-switch" type="button" title="切换" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(a.nickname || '未命名') + '">' + SWITCH_SVG + '</button>') +
+          : (expired || a.authValid === false ? '' : '<button class="wbs-icon-btn wbs-acc-switch" type="button" title="切换" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(a.nickname || '未命名') + '">' + SWITCH_SVG + '</button>') +
             '<button class="wbs-icon-btn wbs-del" type="button" title="删除" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(a.nickname || '未命名') + '">' + TRASH_SVG + '</button>');
-        ops = '<div class="wbs-ops"' + (isCur && isPrimary ? ' hidden' : '') + '>' + ops + '</div>';
+        ops = '<div class="wbs-ops"' + (isCur ? ' hidden' : '') + '>' + ops + '</div>';
         // 国际版没有手机号：用 UIN（账号唯一数字标识）替代展示；国内版仍显示手机。
         // UIN 与手机号共用同一标签和值间距，确保与“剩余”额度列对齐。
         var isUinMode = !a.phone;
@@ -10573,7 +11779,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var idVal = state.mask ? maskAccountId(rawId) : rawId;
         card.innerHTML =
           '<div class="wbs-info">' +
-          '<div class="wbs-row1"><div class="wbs-name-group"><span class="wbs-name">' + esc(nameVal) + '</span>' + primaryBadge + badge + checkinBadge + '</div>' + ops + '</div>' +
+          '<div class="wbs-row1"><div class="wbs-name-group"><span class="wbs-name">' + esc(nameVal) + '</span>' + badge + checkinBadge + invalidAuthBadge + '</div>' + ops + '</div>' +
           '<div class="wbs-meta wbs-secondary-row">' +
           '<div class="wbs-mi wbs-phone-cell' + (isUinMode ? ' wbs-uin-cell' : '') + '"><span class="wbs-lbl">' + idLbl + '</span><span class="wbs-val">' + esc(idVal) + '</span></div>' +
           '<div class="wbs-mi wbs-token-cell"><span class="wbs-lbl">有效期至</span><span class="wbs-val' + (ts.warn ? ' wbs-warn' : '') + '">' + esc(ts.label) + '</span></div>' +
@@ -10581,31 +11787,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           '<div class="wbs-credit-cell">' + creditBlockHtml(credits, a.creditSegments, a) + '</div>' +
           '</div>';
         list.appendChild(card);
-      });
-      list.querySelectorAll('[data-primary-uid]').forEach(function (button) {
-        button.addEventListener('click', function (e) {
-          e.preventDefault(); e.stopPropagation();
-          if (state.primarySaving || button.dataset.primaryUid === state.primaryUid) return;
-          state.primarySaving = true;
-          api('/api/accounts/primary', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ uid: button.dataset.primaryUid }) }).then(function (result) {
-            state.primaryUid = result.primaryUid;
-            toast('已设为主账号，自动化任务可据此识别主账号', false, root);
-            list.querySelectorAll('[data-primary-uid]').forEach(function (item) {
-              var selected = item.dataset.primaryUid === state.primaryUid;
-              item.hidden = selected;
-              var card = item.closest('.wbs-card');
-              var mark = card.querySelector('.wbs-primary-mark');
-              if (!selected && mark) mark.remove();
-              if (selected && !mark) {
-                mark = el('span', 'wbs-primary-mark');
-                mark.setAttribute('role', 'img'); mark.setAttribute('aria-label', wbsTranslateString('主账号', WBS_LANGUAGE)); mark.title = wbsTranslateString('主账号', WBS_LANGUAGE);
-                mark.innerHTML = PRIMARY_ACCOUNT_SVG;
-                card.querySelector('.wbs-name').after(mark);
-              }
-              item.parentElement.hidden = Array.from(item.parentElement.querySelectorAll('button')).every(function (btn) { return btn.hidden; });
-            });
-          }).catch(function (error) { toast(error.message || '设置主账号失败', true, root); }).finally(function () { state.primarySaving = false; });
-        });
       });
       applyAccountMask();
       // 切换按钮：两击确认（第一次点击进入确认态，3s 内再点才真正切换，防止误触）
@@ -10797,6 +11978,143 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       total.textContent = state.creditSummaryValue === null ? '查询中…' : fmtCredits(state.creditSummaryValue);
     }
 
+    function rotationToday() {
+      var d = new Date();
+      return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    }
+
+    function closeRotationNotice() {
+      var notice = state.rotationNotice;
+      if (!notice) return;
+      if (notice.timer) clearInterval(notice.timer);
+      if (notice.place) window.removeEventListener('resize', notice.place);
+      if (notice.node && notice.node.parentNode) notice.node.remove();
+      fab.classList.remove('wbs-fab-credit-alert');
+      state.rotationNotice = null;
+    }
+
+    function showRotationNotice(candidate) {
+      if (!candidate || !candidate.uid || state.open || state.rotationNotice) return;
+      var today = rotationToday();
+      var dismissed = '';
+      try { dismissed = localStorage.getItem('wbs-credit-rotation-dismiss-' + PROFILE_ID) || ''; } catch (_) {}
+      if (dismissed === today) return;
+      var shown = 0;
+      try {
+        var raw = JSON.parse(localStorage.getItem('wbs-credit-rotation-shown-' + PROFILE_ID) || '{}');
+        shown = raw && raw.day === today ? Number(raw.count) || 0 : 0;
+        localStorage.setItem('wbs-credit-rotation-shown-' + PROFILE_ID, JSON.stringify({ day: today, count: shown + 1 }));
+      } catch (_) {}
+      var node = document.createElement('div');
+      node.className = 'wbs-credit-rotation-notice';
+      node.setAttribute('role', 'status');
+      var title = '要切换账号吗？';
+      var expiryCopy = Number.isFinite(Number(candidate.expiresAt))
+        ? ('，有 <b>' + esc(fmtCredits(candidate.remaining)) + '</b> 积分将于 <b>' + esc(formatRotationDays(candidate.expiresAt)) + '</b> 内过期')
+        : '，当前有可用积分';
+      var copy = '检测到积分到期时间最临近的账号「' + esc(candidate.nickname || '未命名账号') + '」' + expiryCopy;
+      node.innerHTML = '<div class="wbs-credit-rotation-title">' + title + '</div>' +
+        '<div class="wbs-credit-rotation-copy">' + copy + '</div>' +
+        '<div class="wbs-credit-rotation-actions"><button type="button" class="wbs-credit-rotation-switch">切换到此账号</button>' +
+        (shown >= 1 ? '<button type="button" class="wbs-credit-rotation-today">今天不再提醒</button>' : '') +
+        '<button type="button" class="wbs-credit-rotation-close" aria-label="关闭">关闭（10）</button></div>';
+      document.body.appendChild(node);
+      function place() {
+        var width = Math.min(330, Math.max(260, window.innerWidth - 24));
+        node.style.width = width + 'px';
+        // Use the untransformed fixed position. Auto-dock moves/rotates the
+        // robot with CSS, so its transformed bounding box can sit outside the
+        // viewport and make an anchored notice appear to be missing.
+        var right = parseFloat(fab.style.right);
+        var bottom = parseFloat(fab.style.bottom);
+        if (!Number.isFinite(right)) right = 22;
+        if (!Number.isFinite(bottom)) bottom = 22;
+        var fabWidth = (fab.offsetWidth || 82) * 0.5;
+        var fabHeight = (fab.offsetHeight || 64) * 0.5;
+        var anchorRight = window.innerWidth - right;
+        var anchorTop = window.innerHeight - bottom - fabHeight;
+        var left = Math.max(12, Math.min(window.innerWidth - width - 12, anchorRight - width));
+        node.style.left = left + 'px';
+        node.style.top = Math.max(12, Math.min(window.innerHeight - node.offsetHeight - 12, anchorTop - node.offsetHeight - 12)) + 'px';
+      }
+      place();
+      var remaining = 10;
+      var timer = setInterval(function () {
+        remaining -= 1;
+        var closeButton = node.querySelector('.wbs-credit-rotation-close');
+        if (closeButton) closeButton.textContent = '关闭（' + Math.max(0, remaining) + '）';
+        if (remaining <= 0) closeRotationNotice();
+      }, 1000);
+      state.rotationNotice = { node: node, timer: timer, uid: candidate.uid };
+      fab.classList.add('wbs-fab-credit-alert');
+      node.querySelector('.wbs-credit-rotation-close').addEventListener('click', closeRotationNotice);
+      var todayBtn = node.querySelector('.wbs-credit-rotation-today');
+      if (todayBtn) todayBtn.addEventListener('click', function () {
+        try { localStorage.setItem('wbs-credit-rotation-dismiss-' + PROFILE_ID, today); } catch (_) {}
+        closeRotationNotice();
+      });
+      node.querySelector('.wbs-credit-rotation-switch').addEventListener('click', function (event) {
+        var button = event.currentTarget;
+        if (button.disabled) return;
+        button.disabled = true;
+        button.textContent = '切换中…';
+        api('/api/switch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid: candidate.uid, reload: true }) })
+          .then(function (result) {
+            closeRotationNotice();
+            toast('已切换为「' + (result.nickname || candidate.nickname || candidate.uid) + '」', false, root);
+            setBuildTimeout(refresh, 1200);
+          })
+          .catch(function (error) {
+            button.disabled = false;
+            button.textContent = '切换到此账号';
+            toast('切换失败：' + (error.message || error), true, root);
+          });
+      });
+      window.addEventListener('resize', place);
+      state.rotationNotice.place = place;
+    }
+
+    function formatRotationEta(expiresAt) {
+      var ts = Number(expiresAt);
+      if (!Number.isFinite(ts)) return '未设置时间';
+      var diff = Math.max(0, ts - Date.now());
+      if (diff < 3600000) return Math.max(1, Math.ceil(diff / 60000)) + ' 分钟后';
+      if (diff < 86400000) return Math.ceil(diff / 3600000) + ' 小时后';
+      return Math.ceil(diff / 86400000) + ' 天后';
+    }
+
+    function formatRotationDays(expiresAt) {
+      var ts = Number(expiresAt);
+      if (!Number.isFinite(ts)) return '较长时间';
+      var diff = Math.max(0, ts - Date.now());
+      if (diff < 86400000) return '1 天';
+      return Math.max(1, Math.ceil(diff / 86400000)) + ' 天';
+    }
+
+    function checkCreditRotationAfterSession() {
+      if (!CAPS.accounts || state.open || state.rotationNotice) return;
+      function run() {
+        if (!state.current || !state.current.uid || state.rotationNotice) return;
+        var current = state.accounts.filter(function (account) { return String(account.uid) === String(state.current.uid); })[0] || { uid: state.current.uid, creditSegments: [] };
+        api('/api/credit-rotation', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uid: current.uid, previousSegments: current.creditSegments }),
+        }).then(function (result) {
+          current.creditSegments = Array.isArray(result && result.current && result.current.segments) ? result.current.segments : current.creditSegments;
+          if (!result || !result.shouldSuggest || !result.candidate) return;
+          showRotationNotice(result.candidate);
+        }).catch(function () {});
+      }
+      if (state.current) { run(); return; }
+      api('/api/accounts').then(function (data) {
+        if (!alive || state.open || !data) return;
+        state.current = data.current || null;
+        state.accounts = mergeAccountSnapshot(state.accounts, data.accounts || []);
+        run();
+      }).catch(function () {});
+    }
+
     function updateCheckinCells(accounts) {
       var cards = accountsPane.querySelectorAll('.wbs-card');
       var byUid = {};
@@ -10836,7 +12154,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           cell.classList.remove('wbs-credit-hidden');
           cell.innerHTML = creditBlockHtml(account.credits, account.creditSegments, account);
           var switchBtn = cards[i].querySelector('.wbs-acc-switch');
-          if (switchBtn) switchBtn.style.display = hidden || account.creditExpired ? 'none' : '';
+          if (switchBtn) switchBtn.style.display = hidden || account.creditExpired || account.authValid === false ? 'none' : '';
         }
       }
     }
@@ -10844,12 +12162,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // Completion events update existing rows without replacing the account list or scroll position.
     var accountRefreshPending = false;
     listen(window, 'workdaddy:accounts-updated', function () {
-      if (!state.open || accountRefreshPending) return;
+      if (!alive || !state.open || accountRefreshPending) return;
       accountRefreshPending = true;
       setBuildTimeout(function () {
         accountRefreshPending = false;
         if (!state.open) return;
-        api('/api/accounts').then(function (data) { if (state.open) updateCheckinCells(data.accounts || []); }).catch(function () {});
+        api('/api/accounts').then(function (data) { if (alive && state.open) updateCheckinCells(data.accounts || []); }).catch(function () {});
       }, 150);
     });
 
@@ -10910,7 +12228,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       state.creditRemaining = accounts.length;
       function settleBatch() {
         if (runId !== state.creditRunId || state.creditRemaining !== 0) return;
-        // 到期信息留在缓存，下次打开前排序，避免响应回来时点到另一账号。
+        if (state.accountSortPending) {
+          state.accountSortPending = false;
+          sortAccountsByCreditExpiry();
+          reorderAccountCards();
+        }
+        // 后续后台批次只更新缓存，下次打开前再排序，避免逐条响应导致账号反复移动。
         var sum = 0;
         state.accounts.forEach(function (account) {
           if (typeof account.credits === 'number' && isFinite(account.credits)) sum += account.credits;
@@ -11010,7 +12333,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       elCredit.classList.remove('wbs-credit-hidden');
       elCredit.innerHTML = creditBlockHtml(credits, segments || [], account);
       var cellSwitch = card.querySelector('.wbs-acc-switch');
-      if (cellSwitch) cellSwitch.style.display = hidden || (account && account.creditExpired) ? 'none' : '';
+      if (cellSwitch) cellSwitch.style.display = hidden || (account && (account.creditExpired || account.authValid === false)) ? 'none' : '';
     }
 
     // ===== 调试：暴露内部状态到 window.__wbsDiag（控制台可调） =====
@@ -11255,56 +12578,66 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     'html.cb-dark .wbs-message-nav-rail,html[data-theme="dark"] .wbs-message-nav-rail,body[data-vscode-theme-name*="dark" i] .wbs-message-nav-rail{background:color-mix(in srgb,var(--wb-bg-popover,#202126) 14%,transparent);border-color:transparent;box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none}',
     'html.cb-dark .wbs-message-nav-rail:hover,html.cb-dark .wbs-message-nav-rail:focus-within,html[data-theme="dark"] .wbs-message-nav-rail:hover,html[data-theme="dark"] .wbs-message-nav-rail:focus-within,body[data-vscode-theme-name*="dark" i] .wbs-message-nav-rail:hover,body[data-vscode-theme-name*="dark" i] .wbs-message-nav-rail:focus-within{background:color-mix(in srgb,var(--wb-bg-popover,#202126) 44%,transparent);border-color:var(--wb-border-subtle,rgba(255,255,255,.12));box-shadow:0 6px 20px rgba(0,0,0,.28);backdrop-filter:blur(14px) saturate(1.12);-webkit-backdrop-filter:blur(14px) saturate(1.12)}',
     'html.cb-dark .wbs-message-nav-tooltip,html[data-theme="dark"] .wbs-message-nav-tooltip,body[data-vscode-theme-name*="dark" i] .wbs-message-nav-tooltip{background:color-mix(in srgb,var(--wb-bg-popover,#202126) 70%,transparent);border-color:var(--wb-border-subtle,rgba(255,255,255,.14));color:var(--wb-color-text-primary,#f2f3f5);box-shadow:0 14px 38px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.08)}',
+    // 毛玻璃主题下移出即隐藏底色与模糊，鼠标点击留下的焦点不会让背景常驻。
+    'html[data-wbs-theme-id="nebula"] .wbs-message-nav-rail:not(:hover){background:transparent;border-color:transparent;box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none}',
+    'html[data-wbs-theme-id="nebula"] .wbs-message-nav-marker:not(:hover){background:transparent;border-color:transparent;backdrop-filter:none;-webkit-backdrop-filter:none}',
+    'html[data-wbs-theme-id="nebula"] .wbs-message-nav-marker:not(:hover):not(:focus-visible){box-shadow:none}',
     '@media (prefers-reduced-motion:reduce){.wbs-message-nav-marker,.wbs-message-nav-dot,.wbs-message-nav-tooltip{transition:none!important}.wbs-message-nav-highlight{animation:none!important}}',
-    /* 机器人悬浮按钮（bitter-dragon-16 移植）：静态版 0.5 倍 · 无头顶尖角 · 眼睛双眨 */
-    '.wbs-fab{position:fixed;right:22px;bottom:22px;z-index:2147483647;transform:scale(0.5);transform-origin:bottom right;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;will-change:transform;transition:transform .22s cubic-bezier(.22,1,.36,1)}',
+    /* 官网演示机器人：尺寸按 2 倍绘制，保留现有 0.5 缩放与停靠/拖动坐标。 */
+    '.wbs-fab[data-wbs-robot-style="black"]{--wbs-robot-shell:#111;--wbs-robot-eye:#fff;--wbs-robot-rim:rgba(255,255,255,.14)}',
+    '.wbs-fab[data-wbs-robot-style="glass"]{--wbs-robot-shell:color-mix(in srgb,var(--wb-bg-popover,#fff) 42%,transparent);--wbs-robot-eye:transparent;--wbs-robot-blur:blur(14px) saturate(1.3);--wbs-robot-rim:color-mix(in srgb,var(--wb-color-text-primary,#222) 18%,transparent)}',
+    '.wbs-fab[data-wbs-robot-style="white"]{--wbs-robot-shell:#fff;--wbs-robot-eye:#111;--wbs-robot-rim:rgba(255,255,255,.55)}',
+    '.wbs-fab{--wbs-robot-shell:#111;--wbs-robot-eye:#fff;--wbs-robot-blur:none;--wbs-robot-rim:rgba(255,255,255,.55);position:fixed;right:22px;bottom:22px;z-index:2147483647;transform:scale(0.5);transform-origin:bottom right;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;will-change:transform;transition:transform .22s cubic-bezier(.22,1,.36,1)}',
     '.wbs-fab-health-dot{position:absolute;top:-5px;left:-5px;width:14px;height:14px;border-radius:50%;background:#8b8f98;border:2px solid #141416;box-shadow:0 1px 3px rgba(0,0,0,.5);z-index:3}',
     '.wbs-fab-health-dot.running{background:#4da3ff}.wbs-fab-health-dot.blocked{background:#ffb03a}.wbs-fab-health-dot.error{background:#ef6262}.wbs-fab-health-dot.suspected{background:#f08a3c}.wbs-fab-health-dot.stopped{background:#9ca3af}',
     '.wbs-health-status{display:none;align-items:center;min-height:18px;padding:2px 7px;border-radius:999px;font-size:10px;line-height:14px;white-space:nowrap;color:var(--wb-color-text-secondary,#666);background:var(--wb-bg-tertiary,#f2f2f2)}',
     '.wbs-health-status.running,.wbs-health-status.blocked,.wbs-health-status.error,.wbs-health-status.suspected,.wbs-health-status.stopped{display:inline-flex}',
     '.wbs-health-status.running{color:#2369a8;background:rgba(77,163,255,.14)}.wbs-health-status.blocked{color:#9a5b00;background:rgba(255,176,58,.18)}.wbs-health-status.error{color:#a52828;background:rgba(239,98,98,.16)}.wbs-health-status.suspected{color:#9a4d0a;background:rgba(240,138,60,.17)}.wbs-health-status.stopped{color:var(--wb-color-text-secondary,#666)}',
     'html.cb-dark .wbs-health-status.running,html[data-theme="dark"] .wbs-health-status.running{color:#b9dcff;background:rgba(77,163,255,.22)}html.cb-dark .wbs-health-status.blocked,html[data-theme="dark"] .wbs-health-status.blocked{color:#ffd58d;background:rgba(255,176,58,.24)}html.cb-dark .wbs-health-status.error,html[data-theme="dark"] .wbs-health-status.error{color:#ffb3b3;background:rgba(239,98,98,.25)}html.cb-dark .wbs-health-status.suspected,html[data-theme="dark"] .wbs-health-status.suspected{color:#ffc18d;background:rgba(240,138,60,.24)}',
-    /* 休眠呼吸灯 keyframes（天线圆点禁用休眠时呼吸；默认毛玻璃由 .wbs-fab-antenna-dot 提供） */
+    /* 休眠状态仍由天线顶部圆点提示。 */
     '@keyframes wbs-sleep-pulse{0%,100%{box-shadow:0 0 5px 1px rgba(46,229,157,.6)}50%{box-shadow:0 0 13px 4px rgba(46,229,157,.95)}}',
     '@keyframes wbs-sleep-pulse-amber{0%,100%{box-shadow:0 0 5px 1px rgba(255,176,58,.6)}50%{box-shadow:0 0 13px 4px rgba(255,176,58,.95)}}',
     '.wbs-fab.hidden{display:none}',
     '.wbs-fab .click{position:relative;transition:transform .22s cubic-bezier(.22,1,.36,1)}',
     '.wbs-fab .click > span:not(.wbs-fab-antenna){display:none}',
     '.wbs-fab .button.shadow{display:none}',
-    '.wbs-fab .button{position:relative;left:0;top:0;transform:none;cursor:pointer;border:solid 4px rgba(255,255,255,0);background-color:rgba(20,20,22,.55);backdrop-filter:blur(14px) saturate(1.3);-webkit-backdrop-filter:blur(14px) saturate(1.3);font-size:20px;color:#fff;border-color:rgba(255,255,255,0);box-shadow:0 4px 14px rgba(0,0,0,.45),inset 0 0 0 1px rgba(255,255,255,.08);border-radius:50px;display:flex;align-items:center;justify-content:center;width:100px;height:48px;box-sizing:content-box;padding:0;margin:0;outline:none;transition:background-color .2s,color .2s}',
+    '.wbs-fab .button{position:relative;left:0;top:0;transform:none;cursor:pointer;border:0;background:var(--wbs-robot-shell);box-shadow:inset 0 2px 0 var(--wbs-robot-rim),0 8px 10px rgba(0,0,0,.12);backdrop-filter:var(--wbs-robot-blur);-webkit-backdrop-filter:var(--wbs-robot-blur);border-radius:22px;display:flex;align-items:center;justify-content:center;width:82px;height:64px;box-sizing:content-box;padding:0;margin:0;outline:none;transition:box-shadow .2s}',
     /* 贴消息队列时（queue 上方）保持纯色背景（与默认黑色一致，逻辑保留） */
-    '.wbs-fab.fab--solid .button{background:#141416;box-shadow:0 4px 14px rgba(0,0,0,.45)}',
+    '.wbs-fab.fab--solid .button{background:var(--wbs-robot-shell)}',
     '.wbs-fab .button:before,.wbs-fab .button:after{display:none}',
     '.wbs-fab .button.up{z-index:2}',
-    /* 天线：SVG mask 数学绘制「圆 + 杆」一体图形（用户 08-30 01:22 修正杆底穿透：设计值 +4px 上移，
-   scale(0.5) 折算后杆底视觉停在按钮顶上方约 2px，不再穿入头部） */
-    '.wbs-fab-antenna{position:absolute;left:50%;top:-28px;width:14px;height:24px;transform:translateX(-50%);background:rgba(20,20,22,.55);backdrop-filter:blur(14px) saturate(1.3);-webkit-backdrop-filter:blur(14px) saturate(1.3);z-index:2;pointer-events:none;mask-image:url("data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 14 24\'><rect x=\'5\' y=\'14\' width=\'4\' height=\'10\'/><circle cx=\'7\' cy=\'7\' r=\'7\'/></svg>");-webkit-mask-image:url("data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 14 24\'><rect x=\'5\' y=\'14\' width=\'4\' height=\'10\'/><circle cx=\'7\' cy=\'7\' r=\'7\'/></svg>");mask-size:14px 24px;-webkit-mask-size:14px 24px;mask-repeat:no-repeat;-webkit-mask-repeat:no-repeat}',
-    /* 呼吸灯圆点：独立于 mask 容器（避免 mask/backdrop-filter 裁剪呼吸辉光），相对 button 定位到天线圆点位置（ant top:-28 内圆占 y0~14 → button 上 -28~-14） */
-    '.wbs-fab-antenna-dot{position:absolute;left:50%;top:-28px;width:14px;height:14px;transform:translateX(-50%);border-radius:50%;background:transparent;pointer-events:none;z-index:4}',
-    /* 休眠呼吸灯：天线顶部圆点（用户 08-30 00:20 要求替代右上角绿点；08-30 00:37 默认改毛玻璃半透明而非纯黑）——默认毛玻璃，禁止休眠时绿/琥珀呼吸 */
+    /* 只遮罩玻璃面层，眼睛直接透出背景；天线和点击区域保持完整。 */
+    '.wbs-robot-masks{position:absolute;pointer-events:none}.wbs-robot-cutout{transform-box:fill-box;transform-origin:center;scale:1;animation:wbs-robot-blink 7s infinite;transition:scale .18s ease}',
+    '.wbs-fab[data-wbs-robot-style="glass"] .button{background:transparent;box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none}',
+    '.wbs-fab[data-wbs-robot-style="glass"] .button:before{content:"";display:block;position:absolute;inset:0;border-radius:inherit;background:var(--wbs-robot-shell);box-shadow:inset 0 2px 0 var(--wbs-robot-rim);backdrop-filter:var(--wbs-robot-blur);-webkit-backdrop-filter:var(--wbs-robot-blur);mask:url("#wbs-robot-face-mask");pointer-events:none}',
+    '.wbs-fab[data-wbs-robot-style="glass"] .eye{visibility:hidden}',
+    '.wbs-fab:hover .wbs-robot-cutout{scale:1.18}',
+    '.wbs-fab-antenna{position:absolute;left:50%;top:-14px;width:6px;height:16px;transform:translateX(-50%);border-radius:6px;background:var(--wbs-robot-shell);pointer-events:none}',
+    '.wbs-fab-antenna-dot{position:absolute;left:50%;top:-18px;width:10px;height:10px;transform:translateX(-50%);border-radius:50%;background:var(--wbs-robot-shell);pointer-events:none;z-index:4}',
+    /* 禁止休眠时绿/琥珀呼吸，关闭后恢复官网机器人天线色。 */
     '#wbs-fab-sleep-light{transition:background .25s,box-shadow .25s}',
     '#wbs-fab-sleep-light.sleep-on{background:rgba(46,229,157,.85);box-shadow:0 0 8px 2px rgba(46,229,157,.85);animation:wbs-sleep-pulse 2.2s ease-in-out infinite}',
     '#wbs-fab-sleep-light.sleep-until-done{background:rgba(255,176,58,.85);box-shadow:0 0 8px 2px rgba(255,176,58,.85);animation:wbs-sleep-pulse-amber 2.2s ease-in-out infinite}',
     '.wbs-fab .click .button .speak~.speak{display:none}',
     '.wbs-fab .speak{position:relative;z-index:2;font-size:15px}',
-    '.wbs-fab .wrap{position:relative;width:100px;height:40px;margin:0 2rem;color:#fff;line-height:40px;font-size:2rem;text-align:center;font-weight:400;margin-bottom:0;display:flex;gap:5px}',
-    '.wbs-fab .eye{position:relative;margin:auto;top:0;bottom:0;background:#fff;width:40px;height:40px;border-radius:50%;display:inline-block;animation:wbs-cc-double-blink 4s cubic-bezier(0.785,0.135,0.15,0.86) infinite;overflow:hidden}',
-    '@keyframes wbs-cc-double-blink{0%,8%{height:40px}10%,12%{height:10px}13%{height:40px}14%,16%{height:0}18%,100%{height:40px}}',
-    '.wbs-fab .eye:before{content:"";position:absolute;margin:auto;width:10px;height:10px;left:0;right:0;top:0;bottom:0;border-radius:50%;background:rgba(20,20,22,.55);backdrop-filter:blur(14px) saturate(1.3);-webkit-backdrop-filter:blur(14px) saturate(1.3);box-shadow:inset 0 0 3px rgba(0,0,0,.35),0 0 0 1px rgba(255,255,255,.14)}',
-    '.wbs-fab .down:before{animation:wbs-cc-downb 4s cubic-bezier(0.785,0.135,0.15,0.86) infinite}',
-    '@keyframes wbs-cc-downb{0%,10%{top:0;left:-10px}20%,40%{top:50%;left:-10px}50%,100%{top:0;left:-10px}}',
-    '.wbs-fab .right-blink:before{animation:wbs-cc-rightb 4s cubic-bezier(0.785,0.135,0.15,0.86) infinite}',
-    '@keyframes wbs-cc-rightb{0%,10%{top:0;left:50%}20%,40%{top:50%;left:50%}50%,100%{top:0;left:50%}}',
-    '.wbs-fab .up-blink:before{animation:wbs-cc-upb 4s cubic-bezier(0.785,0.135,0.15,0.86) infinite}',
-    '@keyframes wbs-cc-upb{0%,10%{top:0;left:0%}20%,40%{top:-50%;left:0%}50%,100%{top:0;left:0%}}',
-    '.wbs-fab:hover{transform:scale(0.5)}',
+    '.wbs-fab .wrap{display:flex;align-items:center;justify-content:center;gap:14px;height:18px}',
+    '.wbs-fab .eye{display:block;width:12px;height:18px;border-radius:6px;background:var(--wbs-robot-eye);scale:1;animation:wbs-robot-blink 7s infinite;transition:scale .18s ease}',
+    '@keyframes wbs-robot-blink{0%,43%,47%,100%{transform:scaleY(1)}45%{transform:scaleY(.15)}}',
+
+
+
+
+
+
+
+    '.wbs-fab:hover{transform:scale(0.5)}.wbs-fab:hover .eye{scale:1.18}',
     '.wbs-fab:active{transform:scale(0.5) translate(2px,2px)}',
     '.wbs-fab.is-quiet{transform:translateX(var(--wbs-fab-quiet-shift,59px)) scale(0.5)}',
     '.wbs-fab.is-quiet .click{transform:rotate(-90deg)}',
     '.wbs-fab.is-quiet .wbs-fab-health-dot{visibility:hidden}',
     '.wbs-fab.is-quiet .wbs-fab-antenna,.wbs-fab.is-quiet .wbs-fab-antenna-dot{visibility:hidden}',
     '.wbs-fab .button:focus-visible{outline:3px solid var(--wb-accent-blue,#4f86ff);outline-offset:5px}',
-    '@media(prefers-reduced-motion:reduce){.wbs-fab,.wbs-fab .click{transition:none!important}}',
+    '@media(prefers-reduced-motion:reduce){.wbs-fab,.wbs-fab .click{transition:none!important}.wbs-fab .eye,.wbs-fab .wbs-robot-cutout{animation:none!important;transition:none!important}}',
     '.wbs-fab.is-dragging{cursor:grabbing;transition:none !important}',
     '.wbs-fab.is-dragging .click{transition:none}',
     '.wbs-fab.is-dragging .button{cursor:grabbing}',
@@ -11324,16 +12657,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-lang-seg .wbs-sess-seg-btn{padding:6px 14px}',
     '.wbs-head{display:flex;align-items:center;justify-content:space-between;padding:16px 18px 12px;border-bottom:1px solid var(--wb-border-subtle,#f0f0f0);background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 30%,transparent)}',
     '.wbs-head-left{display:flex;align-items:center;gap:9px;min-width:0}',
+    '.wbs-brand{display:inline-flex;align-items:center;max-width:100%;padding:0;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer;user-select:none}.wbs-brand:focus-visible{outline:2px solid var(--wb-accent-blue,#4f86ff);outline-offset:4px}.wbs-brand-copy{display:flex;flex-direction:column;align-items:flex-start;min-width:0;gap:0}',
     '.wbs-title-wrap{display:flex;flex-direction:column;align-items:flex-start;min-width:0}',
-    '.wbs-title-row{display:flex;align-items:center;gap:9px;min-width:0}',
-    '.wbs-title{font-size:16px;font-weight:700;color:var(--wb-color-text-primary,#1f1f1f);letter-spacing:.3px;cursor:pointer;user-select:none}',
-    '.wbs-version-line{margin-top:1px;color:var(--wb-color-text-tertiary,#a3a6ad);font-size:10px;font-weight:400;line-height:1.2;letter-spacing:0;font-variant-numeric:tabular-nums;white-space:nowrap}',
+    '.wbs-title-row{display:flex;align-items:center;flex-wrap:wrap;gap:6px 9px;min-width:0}',
+    '.wbs-title{font-family:"Avenir Next",Avenir,"Segoe UI Variable Display","Segoe UI",sans-serif;font-size:15px;line-height:1.15;font-weight:750;letter-spacing:-.55px;color:var(--wb-color-text-primary,#1f1f1f);white-space:nowrap;user-select:none}',
+    '.wbs-version-line{margin:0;color:var(--wb-color-text-tertiary,#a3a6ad);font-size:10px;font-weight:400;line-height:1.2;letter-spacing:0;font-variant-numeric:tabular-nums;white-space:nowrap}',
     /* 元素检查拾取按钮（隐藏入口，连点标题 5 次显示） */
     '.wbs-pick-btn{flex:0 0 auto;width:22px;height:22px;border:none;border-radius:7px;background:color-mix(in srgb,var(--wb-accent-blue,#4f86ff) 14%,transparent);color:var(--wb-accent-blue,#4f86ff);font-size:12px;line-height:1;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;transition:background .15s}',
     '.wbs-pick-btn:hover{background:color-mix(in srgb,var(--wb-accent-blue,#4f86ff) 24%,transparent)}',
-    '.wbs-ghbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;flex-shrink:0;color:var(--wb-icon-tertiary,#999);border-radius:6px;text-decoration:none;transition:color .15s,background .15s}',
-    '.wbs-ghbtn:hover{color:var(--wb-color-text-primary,#1f1f1f);background:var(--wb-bg-hover,#f5f5f5)}',
-    '.wbs-ghbtn svg{display:block}',
     '.wbs-btn-close{border:none;background:none;color:var(--wb-icon-tertiary,#999);font-size:16px;cursor:pointer;padding:4px 6px;border-radius:6px;line-height:1}',
     '.wbs-btn-close:hover{color:var(--wb-color-text-primary,#1f1f1f);background:var(--wb-bg-hover,#f5f5f5)}',
     '.wbs-body{overflow-y:auto;padding:10px 10px 6px;flex:1;min-height:0;height:calc(650px - 170px);max-height:none}',
@@ -11375,19 +12706,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-credit-segment:first-child:last-child{border-radius:3px}',
     '.wbs-credit-segment:hover{z-index:3;filter:brightness(1.12);transform:scaleY(1.35)}',
     /* 官方 WorkBuddy 主题：绿色梯度；越接近到期透明度越高，1 天内只保留很轻的颜色痕迹 */
-    '.wbs-credit-segment.safe{background:rgba(34,197,94,.78);border-color:rgba(34,197,94,.78)}',
-    '.wbs-credit-segment.within30{background:rgba(34,197,94,.62);border-color:rgba(34,197,94,.62)}',
-    '.wbs-credit-segment.within15{background:rgba(34,197,94,.46);border-color:rgba(34,197,94,.46)}',
-    '.wbs-credit-segment.within7{background:rgba(34,197,94,.32);border-color:rgba(34,197,94,.32)}',
-    '.wbs-credit-segment.within3{background:rgba(34,197,94,.20);border-color:rgba(34,197,94,.20)}',
-    '.wbs-credit-segment.within1{background:rgba(34,197,94,.10);border-color:rgba(34,197,94,.10)}',
-    /* WorkDaddy 主题：蓝紫色梯度，保持深色背景上的柔和对比 */
-    'html.cb-dark .wbs-credit-segment.safe{background:rgba(126,134,255,.82);border-color:rgba(126,134,255,.82)}',
-    'html.cb-dark .wbs-credit-segment.within30{background:rgba(126,134,255,.68);border-color:rgba(126,134,255,.68)}',
-    'html.cb-dark .wbs-credit-segment.within15{background:rgba(126,134,255,.54);border-color:rgba(126,134,255,.54)}',
-    'html.cb-dark .wbs-credit-segment.within7{background:rgba(126,134,255,.40);border-color:rgba(126,134,255,.40)}',
-    'html.cb-dark .wbs-credit-segment.within3{background:rgba(126,134,255,.25);border-color:rgba(126,134,255,.25)}',
-    'html.cb-dark .wbs-credit-segment.within1{background:rgba(126,134,255,.12);border-color:rgba(126,134,255,.12)}',
+    '.wbs-credit-segment,.wbs-credit-summary-fill{background:rgba(34,197,94,var(--wbs-credit-alpha,1));border-color:rgba(34,197,94,var(--wbs-credit-alpha,1))}',
+    'html.cb-dark :is(.wbs-credit-segment,.wbs-credit-summary-fill),html[data-theme="dark"] :is(.wbs-credit-segment,.wbs-credit-summary-fill),body[data-vscode-theme-name="IDE Night"] :is(.wbs-credit-segment,.wbs-credit-summary-fill){background:rgba(126,134,255,var(--wbs-credit-alpha,1));border-color:rgba(126,134,255,var(--wbs-credit-alpha,1))}',
     '.wbs-credit-tooltip{display:none;position:fixed;z-index:2147483647;min-width:170px;max-width:260px;padding:8px 10px;border-radius:7px;background:#151518;color:#fff;font-size:11px;font-weight:500;line-height:1.55;white-space:pre-line;box-shadow:0 8px 22px rgba(0,0,0,.28);pointer-events:none}',
     '.wbs-credit-empty{height:5px;border-radius:0;background:color-mix(in srgb,var(--wb-bg-tertiary,#e8e8eb) 70%,transparent);color:var(--wb-icon-tertiary,#999);font-size:10px;line-height:5px;text-align:center}',
     '.wbs-credit-hint{color:var(--wb-icon-tertiary,#999);font-size:10px;line-height:1.4;margin-top:2px}',
@@ -11448,6 +12768,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-ask-label{display:flex;align-items:baseline;gap:6px;font-size:12px;color:var(--wb-color-text-secondary,#444);font-weight:600;min-width:0;line-height:1.3}',
     '.wbs-ask-hint{font-size:11px;color:#9a9a9a;font-weight:400}',
     '.wbs-fab-settings .wbs-ask-row{margin-top:0}.wbs-fab-settings .wbs-ask-label{flex-direction:column;align-items:flex-start;gap:4px}.wbs-fab-settings .wbs-ask-hint{color:var(--wb-color-text-tertiary,#9a9a9a);line-height:1.5;overflow-wrap:anywhere}',
+    '.wbs-robot-option{position:relative;text-align:center;line-height:normal}.wbs-robot-option input{position:absolute;opacity:0;width:1px;height:1px}.wbs-robot-option:has(input:focus-visible){outline:2px solid var(--wb-icon-secondary);outline-offset:1px}',
     '.wbs-fab-settings .wbs-switch-slider{background:var(--wb-bg-tertiary,#e5e5e5);box-shadow:inset 0 0 0 1px var(--wb-border-default,#d0d0d0)}.wbs-fab-settings .wbs-switch-slider:before{background:var(--wb-color-text-secondary,#777)}.wbs-fab-settings input:checked + .wbs-switch-slider{background:var(--wb-button-primary-bg,#1f1f1f)}.wbs-fab-settings input:checked + .wbs-switch-slider:before{background:var(--wb-button-primary-fg,#fff)}.wbs-fab-settings input:focus-visible + .wbs-switch-slider{outline:2px solid var(--wb-accent-blue,#4f86ff);outline-offset:3px}',
     '.wbs-switch{position:relative;display:inline-block;width:36px;height:20px;flex-shrink:0;cursor:pointer}',
     '.wbs-switch input{opacity:0;width:0;height:0}',
@@ -11480,7 +12801,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     'html[data-wbs-language="en"] .wbs-stash-inline:hover .wbs-stash-txt{max-width:96px}',
     '.wbs-explore-inline{position:fixed;left:auto;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;z-index:auto;top:0;right:0;overflow:visible;padding:0 8px}',
     /* 复用暂存按钮视觉（wbs-stash-inline 提供 32px 圆形/背景/阴影），但 hover 不变宽 */
-    '.wbs-stash-inline.wbs-explore-inline:hover{width:32px;height:32px;border-radius:50%;padding:0 8px}',
+    '.wbs-stash-inline.wbs-explore-inline:hover,.wbs-stash-inline.wbs-explore-inline.wbs-stash-inline-inline:hover{width:32px!important;min-width:32px!important;height:32px!important;border-radius:50%;padding:0 8px}',
     /* 图标常显；hover 无任何自身动画 */
     '.wbs-explore-ico{display:flex;align-items:center;justify-content:center}',
     /* 新版内联模式：弹层(absolute)必须以按钮自身为定位上下文——static 会让 .wbs-explore-pop 的 bottom:100% 上溯到最近的 positioned 祖先（操作栏外壳），导致弹层大幅偏离按钮；z-index 抬升让按钮成为独立层叠上下文，弹层在其内不受操作栏兄弟元素压制 */
@@ -11565,7 +12886,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-pcard{background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 18%,transparent);border:1px solid var(--wb-border-subtle,#f0f0f0);border-radius:14px;padding:10px 12px;margin-bottom:8px;backdrop-filter:blur(16px) saturate(1.2);-webkit-backdrop-filter:blur(16px) saturate(1.2)}',
     '.wbs-pcard-title{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;color:var(--wb-color-text-primary,#1f1f1f);margin-bottom:8px}',
     '.wbs-pcard-sub{font-size:11px;color:var(--wb-icon-tertiary,#999);font-weight:400}',
-    '.wbs-primary-mark{display:inline-flex;align-items:center;justify-content:center;flex:0 0 20px;width:20px;height:20px;border-radius:6px;color:var(--wb-button-primary-bg,#1f1f1f);background:color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 10%,transparent)}.wbs-primary-mark svg{width:14px;height:14px}.wbs-set-primary[hidden],.wbs-ops[hidden]{display:none!important}.wbs-set-primary:hover{color:var(--wb-button-primary-bg,#1f1f1f);background:color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 12%,transparent)}.wbs-set-primary:focus-visible{outline:2px solid var(--wb-button-primary-bg,#1f1f1f);outline-offset:2px}',
     '.wbs-auto-card{display:flex;flex:1;flex-direction:column;min-height:0;margin-bottom:0}',
     '.wbs-auto-toolbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px;flex-shrink:0}.wbs-auto-toolbar .wbs-pcard-title{margin-bottom:0}.wbs-auto-toolbar>.wbs-auto-toolbar-actions{flex-basis:100%;justify-content:flex-start}.wbs-auto-toolbar .wbs-sess-bbtn{font-size:11px;padding:5px 8px}',
     '.wbs-auto-toolbar-actions,.wbs-auto-editor-actions,.wbs-auto-normal-actions,.wbs-auto-batch-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.wbs-auto-toolbar-actions{justify-content:flex-end}.wbs-auto-log-head-actions{display:flex;align-items:center;gap:8px}',
@@ -11575,7 +12895,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-auto-row-head{display:flex;align-items:center;gap:8px;min-width:0}.wbs-auto-enabled{flex-shrink:0}.wbs-auto-enabled[hidden]{display:none!important}.wbs-auto-description{color:var(--wb-color-text-secondary,#666);font-size:11px;line-height:1.5;overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}.wbs-auto-row-foot{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:10px}.wbs-auto-details{min-width:0}.wbs-auto-triggers{display:flex;flex-wrap:wrap;gap:4px}.wbs-auto-trigger-chip{display:inline-flex;max-width:100%;padding:2px 6px;border:1px solid var(--wb-border-subtle,#e7e7e7);border-radius:6px;background:var(--wb-bg-tertiary,#f5f5f5);color:var(--wb-color-text-secondary,#666);font-size:10px;line-height:1.4;overflow-wrap:anywhere}.wbs-auto-state-line{display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;min-height:16px;margin-top:5px;color:var(--wb-icon-tertiary,#888);font-size:10px}.wbs-auto-state{display:inline-flex;align-items:center;gap:4px}.wbs-auto-state:before{content:"";width:4px;height:4px;flex:0 0 4px;border-radius:50%;background:currentColor}.wbs-auto-state.running{color:var(--wb-button-primary-bg,#1f1f1f)}.wbs-auto-state.off{opacity:.65}.wbs-auto-last-run.failed{color:var(--wb-color-text-primary,#222)}.wbs-auto-icon:focus-visible{outline:2px solid var(--wb-button-primary-bg,#1f1f1f);outline-offset:1px}',
     '.wbs-auto-row:hover{background:var(--wb-bg-hover,#f5f5f5)}',
     '.wbs-auto-check{display:flex;align-items:center;justify-content:center;flex:0 0 20px;cursor:pointer}.wbs-auto-check input{accent-color:var(--wb-button-primary-bg,#1f1f1f)}',
-    '.wbs-auto-main{min-width:0;flex:1}.wbs-auto-name{display:block;flex:1;min-width:0;font-size:12px;font-weight:650;color:var(--wb-color-text-primary,#1f1f1f);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '.wbs-auto-main{min-width:0;flex:1}.wbs-auto-builtin-badge{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;min-height:18px;padding:1px 6px;box-sizing:border-box;border:1px solid var(--wb-border-default,#d8d8d8);border-radius:999px;background:var(--wb-bg-tertiary,#f5f5f5);color:var(--wb-color-text-secondary,#666);font-size:10px;font-weight:500;line-height:1}.wbs-auto-name{display:block;flex:1;min-width:0;font-size:12px;font-weight:650;color:var(--wb-color-text-primary,#1f1f1f);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
     '.wbs-auto-status{flex:0 0 auto;padding:2px 6px;border-radius:999px;font-size:10px;font-weight:500}.wbs-auto-status.on{color:#1b7f56;background:rgba(46,190,126,.14)}.wbs-auto-status.off{color:var(--wb-icon-tertiary,#888);background:var(--wb-bg-tertiary,#f1f1f1)}',
     '.wbs-auto-meta{margin-top:3px;color:var(--wb-icon-tertiary,#999);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
     '.wbs-auto-enabled{flex:0 0 auto;margin-left:4px}.wbs-auto-actions{display:flex;gap:2px;flex:0 0 auto}.wbs-auto-icon{display:inline-flex;align-items:center;justify-content:center;width:27px;height:27px;padding:0;border:0;border-radius:7px;background:transparent;color:var(--wb-icon-secondary,#666);cursor:pointer;line-height:27px}.wbs-auto-icon svg{width:15px;height:15px;display:block;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round}.wbs-auto-icon:hover,.wbs-auto-icon:focus-visible{background:var(--wb-bg-hover,#f0f0f0);color:var(--wb-color-text-primary,#1f1f1f);outline:none}.wbs-auto-icon.danger:hover{color:#d04a4a}.wbs-auto-icon.is-running,.wbs-auto-icon.is-running:hover{opacity:1;filter:none;background:transparent;color:var(--wb-icon-secondary,#666);cursor:pointer}.wbs-auto-icon:disabled{opacity:.45;cursor:wait}',
@@ -11628,7 +12948,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-sess-seg-btn{flex:1;padding:6px 4px;border:none;border-radius:8px;background:transparent;color:var(--wb-icon-secondary,#666);font-size:12px;font-weight:600;cursor:pointer;transition:all .15s;font-family:inherit;white-space:nowrap}',
     '.wbs-sess-seg-btn:hover{color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-sess-seg-btn.active{background:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-fg,#fff);box-shadow:0 1px 4px rgba(0,0,0,.2)}',
-    '.wbs-sess-toolbar{display:flex;align-items:center;gap:6px;margin-bottom:8px}',
+    '.wbs-sess-toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:8px}',
     '.wbs-sess-refresh{display:flex;align-items:center;justify-content:center;flex-shrink:0;padding:7px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:9px;background:var(--wb-bg-popover,#fff);color:var(--wb-icon-secondary,#555);font-size:12px;cursor:pointer;line-height:1;transition:all .15s}',
     '.wbs-sess-refresh:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-sess-bbtn{display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:7px 12px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:9px;background:var(--wb-bg-popover,#fff);color:var(--wb-icon-secondary,#555);font-size:12px;cursor:pointer;line-height:1;transition:all .15s}',
@@ -11644,7 +12964,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-sess-auto-all.active .wbs-sess-auto-all-box{color:var(--wb-button-primary-bg,#1f1f1f)}',
     '.wbs-sess-auto-all.active .wbs-sess-auto-all-check{opacity:1}',
     '.wbs-sess-auto-all-label{white-space:nowrap}',
-    '.wbs-sess-batchbar{display:flex;align-items:center;gap:5px;flex-wrap:nowrap;margin:0;padding:0;border:none;background:transparent}',
+    '.wbs-sess-batchbar{display:flex;align-items:center;gap:5px;flex-wrap:wrap;min-width:0;margin:0;padding:0;border:none;background:transparent}',
     '.wbs-sess-done{margin-left:auto;color:#fff;background:#141416;border-color:#141416}',
     '.wbs-sess-done:hover{background:#2a2a2e;color:#fff}',
     /* 删除按钮：图标按钮，尺寸与兄弟一致；点击后变警告色（armed） */
@@ -11662,10 +12982,32 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-model-tab:hover{color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-model-tab.active{background:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-fg,#fff);box-shadow:0 1px 4px rgba(0,0,0,.16)}',
     '.wbs-model-tab-count{font-size:12px;opacity:.72;font-variant-numeric:tabular-nums}',
-    '.wbs-model-toolbar{display:flex;align-items:center;gap:6px;min-height:28px;margin-bottom:7px}',
+    '.wbs-model-toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-height:28px;margin-bottom:7px}',
     '.wbs-model-toolbar-spacer{flex:1}',
     '.wbs-model-imports{display:flex;align-items:center;gap:5px;flex-wrap:wrap}',
     '.wbs-model-import:disabled{opacity:.5;cursor:not-allowed}',
+    '.wbs-model-third-party{position:relative;display:inline-flex}',
+    '.wbs-model-source-menu{position:absolute;right:0;top:calc(100% + 4px);z-index:10;min-width:120px;padding:4px;border:1px solid var(--wb-border-default,#ddd);border-radius:8px;background:var(--wb-bg-popover,#fff);box-shadow:0 6px 20px rgba(0,0,0,.16)}',
+    '.wbs-model-source-menu button{width:100%;padding:8px;text-align:left;border:0;border-radius:5px;background:transparent;color:var(--wb-color-text-primary,#222);font:inherit;font-size:12px;cursor:pointer}',
+    '.wbs-model-source-menu button:hover,.wbs-model-source-menu button:focus-visible{background:var(--wb-bg-hover,#f3f3f3)}',
+    '.wbs-modal.wbs-model-import-modal{width:640px;max-width:calc(100vw - 32px);box-sizing:border-box;max-height:88vh;display:flex;flex-direction:column}',
+    '.wbs-modal.wbs-model-import-confirm{width:380px}',
+    '.wbs-model-import-modal .wbs-modal-body{min-height:0;max-height:min(520px,65vh);flex-shrink:1;overflow-wrap:anywhere;font-size:12px;line-height:1.5}',
+    '.wbs-third-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:12px;position:sticky;top:0;background:var(--wb-bg-popover,#fff);z-index:1;padding-bottom:6px}',
+    '.wbs-third-toolbar .wbs-third-all{flex:1}',
+    '.wbs-third-toolbar select{max-width:100%;font-size:12px}',
+    '.wbs-third-all{display:flex;align-items:center;gap:8px;padding:4px 2px;font-size:12px}',
+    '.wbs-third-all [data-third-count]{margin-left:auto;color:var(--wb-icon-secondary,#666)}',
+    '.wbs-third-row{display:flex;align-items:flex-start;gap:8px;padding:8px 5px;border-bottom:1px solid var(--wb-border-default,#eee);cursor:pointer}',
+    '.wbs-third-row:hover{background:var(--wb-bg-hover,#f3f3f3)}',
+    '.wbs-third-row input{flex-shrink:0;margin-top:3px}',
+    '.wbs-third-text{display:flex;flex-direction:column;gap:3px;min-width:0;color:var(--wb-icon-secondary,#666);font-size:11px;overflow-wrap:anywhere}',
+    '.wbs-third-text strong{color:var(--wb-color-text-primary,#222);font-size:12px;font-weight:600}',
+    '.wbs-third-note{color:var(--wb-color-text-primary,#333)}',
+    '.wbs-third-unavailable{opacity:.6;cursor:default}',
+    '.wbs-model-import-modal input{accent-color:var(--wb-button-primary-bg,#333)}',
+    '.wbs-model-import-modal button:disabled{opacity:.45;cursor:default}',
+
     '.wbs-model-count{font-size:13px;color:var(--wb-icon-tertiary,#888)}',
     '.wbs-model-batchbar{display:flex;align-items:center;gap:5px;flex-wrap:nowrap;margin:0;padding:0;border:none;background:transparent}',
     '.wbs-model-batch-count{font-size:11px;color:var(--wb-icon-tertiary,#999);white-space:nowrap}',
@@ -11776,6 +13118,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     'html.cb-dark .wbs-modal-btn.wbs-modal-danger,html[data-theme="dark"] .wbs-modal-btn.wbs-modal-danger{color:#fff;background:#e03d3d;border-color:#e03d3d}',
     'html.cb-dark .wbs-modal-btn.wbs-modal-danger:hover,html[data-theme="dark"] .wbs-modal-btn.wbs-modal-danger:hover{background:#f04a4a}',
     'html.cb-dark .wbs-modal-mask,html[data-theme="dark"] .wbs-modal-mask{background:rgba(0,0,0,.55)}',
+    '.wbs-checkin-risk-mask{padding:12px;box-sizing:border-box;pointer-events:auto}',
+    '.wbs-modal.wbs-checkin-risk-modal{box-sizing:border-box;width:360px;max-width:100%;max-height:100%;display:flex;flex-direction:column;min-height:0}',
+    '.wbs-checkin-risk-modal .wbs-modal-title,.wbs-checkin-risk-modal .wbs-modal-actions{flex-shrink:0}',
+    '.wbs-checkin-risk-modal .wbs-modal-body{min-height:0;max-height:none;line-height:1.65;font-size:12px;overflow-wrap:anywhere;overscroll-behavior:contain}',
+    '.wbs-checkin-risk-modal p{margin:0}.wbs-checkin-risk-modal .wbs-modal-actions{flex-wrap:wrap}',
+    '.wbs-checkin-risk-modal .wbs-modal-btn{line-height:1.4;white-space:normal;transition:background .15s,color .15s,border-color .15s}',
+    '.wbs-checkin-risk-modal .wbs-modal-btn.wbs-modal-ok{background:var(--wb-button-primary-bg,#141416);color:var(--wb-button-primary-fg,#fff);border-color:var(--wb-button-primary-bg,#141416)}',
+    '.wbs-checkin-risk-modal .wbs-modal-btn.wbs-modal-ok:hover{background:var(--wb-button-primary-hover-bg,var(--wb-button-primary-bg,#2a2a2e))}',
+    '.wbs-checkin-risk-modal .wbs-modal-btn:focus-visible{outline:2px solid var(--wb-color-text-primary,#1f1f1f);outline-offset:2px}',
+    '.wbs-checkin-risk-modal .wbs-modal-btn:disabled{opacity:.55;cursor:wait}',
+    '.wbs-checkin-risk-error{font-size:12px;line-height:1.5;overflow-wrap:anywhere;margin-bottom:10px;color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-modal-title{font-size:13px;font-weight:700;color:var(--wb-color-text-primary,#1f1f1f);margin-bottom:10px}',
     '.wbs-modal-body{display:flex;flex-direction:column;gap:6px;max-height:280px;overflow-y:auto;margin-bottom:12px}',
     '.wbs-modal-action{display:block;width:100%;text-align:left;padding:8px 10px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:9px;background:var(--wb-bg-popover,#fff);color:var(--wb-color-text-primary,#1f1f1f);font-size:12px;cursor:pointer;line-height:1;transition:all .15s}',
@@ -11808,6 +13161,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-sleep-mode-hint{font-size:11px;color:var(--wb-icon-tertiary,#999);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     /* 关于页：项目信息卡（名字/标语/原理徽章/介绍 + 支持项目入口 + 版本） */
     '.wbs-about-hero{display:flex;flex-direction:column;align-items:center;gap:8px;padding:20px 16px 16px}',
+    '.wbs-about-brand{display:inline-flex;align-items:center;gap:8px;min-width:0}.wbs-about-logo{display:block;width:32px;height:32px;flex:0 0 32px;border-radius:9px;object-fit:cover;box-shadow:0 0 0 1px var(--wb-border-subtle,rgba(0,0,0,.08))}',
     '.wbs-about-name{font-size:18px;font-weight:700;letter-spacing:.3px;color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-about-tag{font-size:12.5px;color:var(--wb-icon-tertiary,#888);text-align:center;line-height:1.5}',
     '.wbs-about-badge{font-size:11px;font-weight:600;color:var(--wb-button-primary-bg,#1f1f1f);background:rgba(0,0,0,.05);border:1px solid rgba(0,0,0,.08);padding:3px 10px;border-radius:999px;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}',
@@ -11899,19 +13253,30 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-bg-upload-ico{width:30px;height:30px;border-radius:50%;background:var(--wb-bg-hover,#e8e9eb);display:flex;align-items:center;justify-content:center;font-size:18px;line-height:1;font-weight:400}',
     '.wbs-bg-upload-hint{font-size:11px;color:var(--wb-icon-tertiary,#999);font-weight:400}',
     '.wbs-bg-preview{display:none;width:100%;max-height:140px;object-fit:cover;border-radius:10px;margin-top:8px;border:1px solid var(--wb-border-subtle,#eee)}',
-    '.wbs-avatar-preview{width:32px;height:32px;border-radius:50%;object-fit:cover;border:1px solid var(--wb-border-subtle,#eee);display:none;flex-shrink:0;background:var(--wb-bg-tertiary,#f0f0f0);cursor:pointer;transition:transform .15s}',
-    '.wbs-avatar-preview:hover{transform:scale(1.08)}',
+    '.wbs-avatar-option{position:relative;display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer;font-size:10px;color:var(--wb-color-text-secondary)}.wbs-avatar-option input{position:absolute;opacity:0;width:1px;height:1px}.wbs-avatar-option img{box-sizing:border-box;width:42px;height:42px;padding:3px;object-fit:contain;border:1px solid var(--wb-border-subtle);border-radius:10px;background:var(--wb-bg-tertiary)}.wbs-avatar-option input:checked+img{border-color:var(--wb-button-primary-bg);box-shadow:0 0 0 1px var(--wb-button-primary-bg)}.wbs-avatar-option input:focus-visible+img{outline:2px solid var(--wb-accent-blue);outline-offset:3px}',
     /* 背景蒙版滑块（黑色半透明遮罩，0~100%） */
     '.wbs-mask-row{display:flex;align-items:center;gap:8px;margin-top:8px}',
     '.wbs-mask-row input[type=range]{flex:1;min-width:0;accent-color:#f2f2f4;height:4px;cursor:pointer}',
     '.wbs-mask-val{font-size:11px;color:var(--wb-icon-tertiary,#888);flex-shrink:0;min-width:28px;text-align:right;font-variant-numeric:tabular-nums}',
     /* 头像/增强行 */
-    '.wbs-avatar-row{display:flex;align-items:center;gap:8px;margin-bottom:10px}',
+    '.wbs-avatar-row{display:flex;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:10px}.wbs-avatar-custom-list{display:contents}.wbs-avatar-custom{position:relative}.wbs-avatar-add{box-sizing:border-box;display:flex;align-items:center;justify-content:center;flex:0 0 42px;width:42px;height:42px;padding:3px;border:1px dashed var(--wb-border-default);border-radius:10px;background:var(--wb-bg-tertiary);color:var(--wb-icon-secondary);cursor:pointer}.wbs-avatar-add:hover{background:var(--wb-bg-hover)}.wbs-avatar-add:focus-visible,.wbs-avatar-delete:focus-visible{outline:2px solid var(--wb-icon-secondary);outline-offset:2px}.wbs-avatar-delete{position:absolute;top:-6px;right:-6px;display:flex;align-items:center;justify-content:center;width:20px;height:20px;padding:0;border:1px solid var(--wb-border-default);border-radius:50%;background:var(--wb-bg-popover);color:var(--wb-color-text-primary);cursor:pointer;opacity:0;pointer-events:none}.wbs-avatar-custom:hover .wbs-avatar-delete,.wbs-avatar-custom:focus-within .wbs-avatar-delete{opacity:1;pointer-events:auto}',
     '.wbs-tab svg{flex-shrink:0}',
     '.wbs-enh-row{display:flex;gap:8px;margin-bottom:8px}',
     '.wbs-enh-tip{font-size:11px;color:var(--wb-icon-tertiary,#999);line-height:1.5;padding:4px 2px 0}',
     /* 账号列表容器 + 退出按钮 */
     '.wbs-acct-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px 9px;border-bottom:1px solid var(--wb-border-subtle,#f0f0f0);background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 25%,transparent);flex-shrink:0}',
+    '#wbs-account-order-mask{pointer-events:auto;overscroll-behavior:contain}',
+    '.wbs-account-order-modal{box-sizing:border-box;width:360px;max-width:calc(100% - 28px);max-height:calc(100% - 28px);display:flex;flex-direction:column;overflow:auto}',
+    '.wbs-account-order-modes{display:flex;flex-wrap:wrap;gap:10px 16px;font-size:12px}.wbs-account-order-modes label{display:flex;align-items:center;gap:5px;cursor:pointer}.wbs-account-order-modes input{margin:0;accent-color:var(--wb-button-primary-bg)}',
+
+    '.wbs-account-order-list{margin-top:12px;max-height:min(280px,40vh);overflow:auto;overscroll-behavior:contain;display:flex;flex-direction:column;gap:5px}',
+    '.wbs-account-order-row{display:flex;align-items:center;gap:8px;min-height:34px;padding:3px 8px;border:1px solid var(--wb-border-subtle);border-radius:8px;background:var(--wb-bg-secondary);font-size:12px}.wbs-account-order-row>span{flex:1;min-width:0;overflow-wrap:anywhere}.wbs-account-order-row button{cursor:grab}.wbs-account-order-row.dragging{opacity:.45}.wbs-account-order-row.drop-target{border-color:var(--wb-accent-blue);background:var(--wb-bg-hover)}',
+    '.wbs-account-order-modal :is(button,input):focus-visible{outline:2px solid var(--wb-accent-blue);outline-offset:2px}.wbs-account-order-modal button:disabled{opacity:.5;cursor:default}',
+    '.wbs-credit-summary-popover{position:fixed;z-index:2147483647;box-sizing:border-box;width:300px;max-width:calc(100vw - 16px);padding:12px;background:var(--wb-bg-popover,var(--wb-bg-primary));color:var(--wb-color-text-primary);border:1px solid var(--wb-border-default);border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.18);font:12px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;overflow:auto;overscroll-behavior:contain;pointer-events:auto}',
+    '.wbs-credit-summary-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px}.wbs-credit-summary-head strong{font-size:13px}.wbs-credit-summary-head span,.wbs-credit-summary-foot{font-size:10px;color:var(--wb-color-text-secondary)}',
+    '.wbs-credit-summary-chart{max-height:230px;overflow:auto;overscroll-behavior:contain}.wbs-credit-summary-row{display:grid;grid-template-columns:68px minmax(30px,1fr) 58px;align-items:center;gap:8px;min-height:28px}.wbs-credit-summary-row>span{font-size:11px;color:var(--wb-color-text-secondary)}.wbs-credit-summary-row>b{text-align:right;font-size:11px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.wbs-credit-summary-track{height:8px;border-radius:4px;background:var(--wb-bg-tertiary);overflow:hidden}.wbs-credit-summary-track i{display:block;height:100%;border-radius:4px;}.wbs-credit-summary-foot{border-top:1px solid var(--wb-border-subtle);padding-top:8px;margin-top:8px}',
+    'html.cb-dark .wbs-credit-summary-popover,html[data-theme="dark"] .wbs-credit-summary-popover,body[data-vscode-theme-name="IDE Night"] .wbs-credit-summary-popover{background:var(--wb-bg-popover,var(--wb-bg-primary));color:var(--wb-color-text-primary);border-color:var(--wb-border-default)}',
+    '@media(max-width:600px){.wbs-acct-toolbar{flex-wrap:wrap;gap:8px}.wbs-acct-summary{flex-wrap:wrap}.wbs-acct-actions{margin-left:auto}}',
     '.wbs-acct-summary{display:flex;align-items:center;gap:12px;min-width:0}',
     '.wbs-acct-eye{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:none;border-radius:6px;background:transparent;color:var(--wb-icon-secondary,var(--wb-color-text-secondary,#666));cursor:pointer;flex-shrink:0;transition:color .15s,background-color .15s}',
     '.wbs-acct-eye:hover{background:var(--wb-bg-hover,#f0f0f0);color:var(--wb-color-text,#222)}',
@@ -11927,17 +13292,51 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-acct-io:hover{background:var(--wb-bg-hover,#f0f0f0);border-color:var(--wb-border-default,#d5d5d5)}',
     '.wbs-acct-io svg{flex-shrink:0}',
     '.wbs-acct-io span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '.wbs-acct-icon{width:28px;height:28px;padding:0;border-radius:8px}',
     '.wbs-acct-list{flex:1;min-height:0;overflow-y:auto;padding-right:2px}',
     '.wbs-logout-btn{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;margin-top:10px;padding:10px 0;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:12px;background:transparent;color:var(--wb-icon-secondary,#666);font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;font-family:inherit;flex-shrink:0}',
     '.wbs-logout-btn:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f);border-color:var(--wb-border-default,#d5d5d5)}',
     '.wbs-logout-btn.armed{background:#f53f3f;color:#fff;border-color:#f53f3f}',
     '.wbs-logout-btn svg{width:15px;height:15px}',
+    '.wbs-credit-rotation-notice{position:fixed;z-index:2147483647;box-sizing:border-box;padding:13px 14px 11px;border:1px solid rgba(0,0,0,.08);border-radius:12px;background:#fff;color:#1f2937;box-shadow:0 10px 28px rgba(0,0,0,.16);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;animation:wbs-credit-rotation-in .2s cubic-bezier(.22,1,.36,1)}',
+    '@keyframes wbs-credit-rotation-in{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}',
+    '.wbs-credit-rotation-title{font-size:13px;font-weight:700;line-height:1.4}',
+    '.wbs-credit-rotation-copy{margin-top:5px;font-size:11px;line-height:1.55;color:#667085;word-break:break-word}',
+    '.wbs-credit-rotation-copy b{color:#1f2937;font-weight:700}',
+    '.wbs-credit-rotation-actions{display:flex;align-items:center;gap:6px;margin-top:10px}',
+    '.wbs-credit-rotation-actions button{min-height:26px;border-radius:7px;padding:0 9px;font:inherit;font-size:11px;cursor:pointer;white-space:nowrap}',
+    '.wbs-credit-rotation-switch{border:1px solid #1f1f1f;background:#1f1f1f;color:#fff}',
+    '.wbs-credit-rotation-switch:hover{background:#333}',
+    '.wbs-credit-rotation-today,.wbs-credit-rotation-close{border:1px solid rgba(0,0,0,.1);background:#fff;color:#667085}',
+    '.wbs-credit-rotation-today:hover,.wbs-credit-rotation-close:hover{background:#f5f6f8;color:#1f2937}',
+    '.wbs-credit-rotation-actions button:disabled{opacity:.55;cursor:wait}',
+    '.wbs-fab.wbs-fab-credit-alert .button{animation:wbs-credit-robot-alert .45s ease-out}',
+    '@keyframes wbs-credit-robot-alert{0%,100%{transform:translateY(0)}45%{transform:translateY(-5px)}75%{transform:translateY(1px)}}',
+    '.wbs-token-stats-modal{width:min(760px,calc(100% - 24px));max-height:min(86vh,760px);display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--wb-border-default,rgba(20,24,32,.14))}',
+    '.wbs-usage-header{flex-shrink:0}.wbs-usage-scroll{min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;flex:1;padding-right:3px}.wbs-token-stats-modal>.wbs-modal-actions{flex-shrink:0}.wbs-token-stats-modal .wbs-token-model-scroll{max-height:none;overflow:visible}.wbs-token-stats-modal .wbs-token-model-scroll:after{display:none}.wbs-credit-query-content{position:relative;min-height:330px}.wbs-token-stats-filters.wbs-credit-filters{grid-template-columns:repeat(2,minmax(0,1fr))}',
+    '.wbs-token-stats-head{display:flex;align-items:center;justify-content:space-between;gap:10px}',
+    '.wbs-token-source-note{margin:0 0 12px;font-size:11px;line-height:1.6;color:var(--wb-icon-secondary,#667085);overflow-wrap:anywhere}',
+    '.wbs-usage-tabs{display:flex;gap:4px;margin:10px 0 2px;border-bottom:1px solid var(--wb-border-subtle,#eee)}.wbs-usage-tabs button{border:0;border-bottom:2px solid transparent;background:transparent;color:var(--wb-icon-secondary,#667085);padding:6px 12px;font:inherit;font-size:12px;cursor:pointer}.wbs-usage-tabs button.active{border-bottom-color:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-color-text-primary,#1f1f1f);font-weight:650}.wbs-credit-stats-note{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0;color:var(--wb-icon-secondary,#667085);font-size:11px;line-height:1.5}.wbs-credit-sync{height:26px;padding:0 9px;border:1px solid var(--wb-border-default,#e2e4e8);border-radius:7px;background:var(--wb-bg-tertiary,#f5f6f8);color:var(--wb-color-text-primary,#1f1f1f);font:inherit;font-size:11px;cursor:pointer}.wbs-credit-sync:disabled{opacity:.6;cursor:wait}.wbs-credit-stats-body{min-height:180px}',
+    '.wbs-token-stats-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:12px 0}',
+    '.wbs-token-stats-filters label{display:flex;align-items:center;gap:6px;min-width:0;font-size:11px;color:var(--wb-icon-secondary,#667085)}',
+    '.wbs-token-stats-filters select{min-width:0;flex:1;height:30px;padding:0 7px;border:1px solid var(--wb-border-default,#e2e4e8);border-radius:7px;background:var(--wb-bg-secondary,#fff);color:var(--wb-color-text-primary,#1f1f1f);font:inherit}',
+    '.wbs-token-stats-actions{display:flex;justify-content:flex-end;gap:7px;margin:2px 0 12px}.wbs-token-stats-actions button{height:30px;padding:0 14px;border-radius:7px;font:inherit;font-size:11px;cursor:pointer}.wbs-token-stats-search{border:1px solid var(--wb-button-primary-bg,#1f1f1f);background:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-text,#fff)}.wbs-token-stats-reset{border:1px solid var(--wb-border-default,#e2e4e8);background:var(--wb-bg-tertiary,#f5f6f8);color:var(--wb-color-text-secondary,#667085)}.wbs-token-stats-actions button:disabled{opacity:.55;cursor:wait}',
+    '.wbs-token-stats-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}',
+    '.wbs-token-stats-grid>div{display:flex;min-width:0;flex-direction:column;gap:4px;padding:7px 5px;border-radius:7px;background:var(--wb-bg-tertiary,#f5f6f8)}',
+    '.wbs-token-stats-grid span{font-size:10px;color:var(--wb-icon-tertiary,#8a8f98)}',
+    '.wbs-token-stats-grid strong{font-size:12px;color:var(--wb-color-text-primary,#1f1f1f);font-variant-numeric:tabular-nums}',
+    '.wbs-token-stats-section{margin-top:14px;border-top:1px solid var(--wb-border-subtle,#eee);padding-top:9px}.wbs-token-stats-section-title{font-size:12px;font-weight:650;color:var(--wb-color-text-primary,#1f1f1f);margin-bottom:8px}',
+    '.wbs-token-stats-chart{display:flex;align-items:flex-end;gap:8px;height:125px;overflow-x:auto;padding:0 4px 2px;border-bottom:1px solid var(--wb-border-subtle,#eee)}.wbs-token-day{display:flex;min-width:38px;height:100%;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;font-size:9px;color:var(--wb-icon-tertiary,#8a8f98)}.wbs-token-day i{display:block;width:18px;min-height:3px;border-radius:4px 4px 0 0;background:var(--wb-button-primary-bg,#1f1f1f)}.wbs-token-day b{font-size:9px;font-weight:500;color:var(--wb-icon-secondary,#667085);font-variant-numeric:tabular-nums}',
+    '.wbs-token-model-scroll{position:relative;max-height:220px;overflow-y:auto;scrollbar-width:thin}.wbs-token-model-scroll:after{content:"";position:sticky;display:block;bottom:0;height:28px;margin-top:-28px;background:linear-gradient(to bottom,transparent,color-mix(in srgb,var(--wb-bg-popover,#fff) 92%,transparent));pointer-events:none;opacity:1;transition:opacity .16s}.wbs-token-model-scroll.at-end:after,.wbs-token-model-scroll.no-overflow:after{opacity:0}.wbs-token-stats-table{display:flex;flex-direction:column;gap:4px}.wbs-token-stats-table>div{display:grid;grid-template-columns:minmax(0,1fr) 100px 60px;gap:8px;align-items:center;font-size:11px;color:var(--wb-color-text-secondary,#667085)}.wbs-token-stats-table span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.wbs-token-stats-table b{color:var(--wb-color-text-primary,#1f1f1f);font-variant-numeric:tabular-nums;text-align:right}.wbs-token-stats-table em{font-style:normal;color:var(--wb-icon-tertiary,#8a8f98);text-align:right}',
+    '.wbs-token-stats-loading{min-height:330px;display:flex;align-items:center;justify-content:center;color:var(--wb-icon-secondary,#667085);font-size:12px}.wbs-token-stats-content{position:relative;min-height:330px}.wbs-token-stats-body{min-height:330px}.wbs-token-stats-overlay{position:absolute;inset:0;z-index:2;display:flex;align-items:center;justify-content:center;border-radius:9px;background:color-mix(in srgb,var(--wb-bg-popover,#fff) 38%,transparent);color:var(--wb-button-primary-bg,#1f1f1f);backdrop-filter:blur(1.5px);-webkit-backdrop-filter:blur(1.5px)}.wbs-token-stats-overlay[hidden],.wbs-token-stats-overlay span[hidden]{display:none!important}.wbs-token-stats-spinner{display:flex;flex-direction:column;align-items:center;gap:10px;color:var(--wb-icon-secondary,#667085);font-size:11px}.wbs-token-stats-spinner svg{width:24px;height:24px;animation:wbs-token-spin .8s linear infinite}.wbs-token-stats-spinner circle{fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-dasharray:36 22}@keyframes wbs-token-spin{to{transform:rotate(360deg)}}.wbs-token-stats-empty{font-size:12px;line-height:1.6;color:var(--wb-icon-tertiary,#8a8f98)}.wbs-token-empty-trend{margin:auto;text-align:center}.wbs-token-empty-model{display:flex!important;align-items:center;justify-content:center;min-height:150px;text-align:center}.wbs-token-model-scroll.no-overflow:has(.wbs-token-empty-model){max-height:none}',
+    'html.cb-dark #wbs-token-stats-modal,html[data-theme="dark"] #wbs-token-stats-modal,body[data-vscode-theme-name*="dark" i] #wbs-token-stats-modal{color-scheme:dark}#wbs-token-stats-modal .wbs-token-stats-modal{box-sizing:border-box;max-height:calc(100% - 24px)}.wbs-token-stats-modal{position:relative}.wbs-credit-filters label{white-space:nowrap}.wbs-credit-stats-toolbar{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap;font-size:11px;color:var(--wb-icon-secondary,#667085)}.wbs-token-stats-grid.wbs-credit-stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.wbs-credit-chart{height:142px}.wbs-credit-day{height:138px;flex-shrink:0}.wbs-credit-bar-track{height:100px;flex:0 0 100px;display:flex;align-items:flex-end}.wbs-credit-bar-track i{min-height:0;flex-shrink:0}.wbs-credit-sync{height:auto;min-height:28px;white-space:normal}.wbs-credit-sync-overlay{position:absolute;inset:0;z-index:5;display:flex;align-items:center;justify-content:center;padding:16px;background:color-mix(in srgb,var(--wb-bg-popover,#fff) 84%,transparent);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);border-radius:inherit;pointer-events:auto}.wbs-credit-sync-overlay[hidden],[data-credit-result][hidden],[data-usage-pane][hidden]{display:none!important}.wbs-credit-sync-progress{display:flex;flex-direction:column;align-items:stretch;gap:12px;width:min(100%,340px);font-size:12px;line-height:1.6;overflow-wrap:anywhere;color:var(--wb-color-text-primary,#1f1f1f)}.wbs-credit-sync-progress>span{color:var(--wb-icon-secondary,#667085)}.wbs-credit-sync-progress progress{width:100%;height:8px;accent-color:var(--wb-button-primary-bg,#1f1f1f)}.wbs-credit-sync-progress button{align-self:center}.wbs-usage-tabs button:focus-visible,.wbs-credit-sync:focus-visible,.wbs-credit-filters select:focus-visible{outline:2px solid var(--wb-button-primary-bg,#1f1f1f);outline-offset:2px}',
+    '@media(max-width:620px){.wbs-token-stats-filters{grid-template-columns:1fr 1fr}.wbs-token-stats-filters label:first-child{grid-column:1/-1}.wbs-token-stats-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.wbs-token-stats-modal{max-height:calc(100vh - 24px)}}',
     /* 登录新账号二选一弹窗（方法一 假退出 / 方法二 无感登录） */
     /* 选择登录方式：遮罩限定在 WorkDaddy 面板内部，沿用会话弹窗的层级与按钮风格 */
     '.wbs-pane{position:relative}',
     '@keyframes wbs-modal-in{from{opacity:0}to{opacity:1}}',
     '.wbs-panel-modal-mask{position:absolute;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;padding:14px;background:transparent;pointer-events:auto;animation:wbs-modal-in .16s ease}',
-    '.wbs-login-modal{width:min(360px,calc(100% - 28px));box-sizing:border-box;padding:16px;border:1px solid var(--wb-border-default,rgba(0,0,0,.12));border-radius:14px;background:var(--wb-bg-popover,#fff);box-shadow:0 10px 40px rgba(0,0,0,.25)}',
+    '.wbs-login-modal{width:min(360px,calc(100% - 28px));box-sizing:border-box;padding:16px;border:1px solid var(--wb-border-default,rgba(0,0,0,.12));border-radius:14px;background:var(--wb-bg-popover,#fff);box-shadow:0 10px 40px rgba(0,0,0,.25)}.wbs-import-choice-modal{width:min(460px,calc(100% - 28px))}.wbs-import-json-hint{margin:-3px 0 12px;padding:9px 10px;border:1px solid var(--wb-border-subtle,rgba(20,24,32,.14));border-radius:9px;background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 55%,transparent);color:var(--wb-icon-secondary,#667085);font-size:11px;line-height:1.55}.wbs-import-json-hint[hidden]{display:none!important}',
     '.wbs-login-modal-title{font-size:15px;font-weight:700;line-height:1.35;color:var(--wb-color-text-primary,#1f1f1f);margin:0 0 14px}',
     '.wbs-password-modal{width:min(360px,calc(100% - 28px));box-sizing:border-box;padding:16px;border:1px solid var(--wb-border-default,rgba(0,0,0,.12));border-radius:14px;background:var(--wb-bg-popover,#fff);box-shadow:0 10px 40px rgba(0,0,0,.25)}',
     '.wbs-password-field{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--wb-icon-secondary,#666)}',
@@ -11973,6 +13372,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-empty{text-align:center;color:var(--wb-icon-tertiary,#999);padding:28px 10px;font-size:12px}',
     /* body 高度：无底部功能区后最大化 */
     '.wbs-body{max-height:calc(min(78vh,660px) - 118px)}',
+    // 账号页填满面板剩余空间：少量账号时登录按钮靠底部，长列表仍在列表内滚动。
+    '.wbs-body:has(>[data-pane="account"].active){max-height:none;overflow:hidden}',
   ].join('');
   (document.head || document.documentElement).appendChild(css);
   start();

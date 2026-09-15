@@ -210,7 +210,7 @@ test('WorkDaddy-triggered reload injects on the new main execution context befor
   assert.match(yieldHelper, /await reloadPriority/);
   assert.match(yieldHelper, /pendingReloadInjection/);
   assert.match(yieldHelper, /await pending\.ready/);
-  const syncEnd = script.indexOf('\nconst MAX_SESSION_EXPORT_BYTES', syncStart);
+  const syncEnd = script.indexOf('\nconst MAX_SESSION_EXPORT_FILES', syncStart);
   const syncLineage = script.slice(syncStart, syncEnd);
   assert.ok((syncLineage.match(/await yieldAutoCopyToRenderer\(\)/g) || []).length >= 2, 'lineage scans and copies must pause for renderer reloads');
   assert.match(switchRoute, /const releaseRendererReload = body\.reload \? beginRendererReloadPriority\(\) : null/);
@@ -656,7 +656,7 @@ test('Windows Setup waits for WorkBuddy and stops only a native-verified profile
   assert.match(installer, /if IsAdmin and not ConfirmElevatedInstall/);
   assert.match(installer, /MB_YESNO/);
   assert.match(installer, /IDYES/);
-  assert.match(installer, /if IsAdmin then\s+exit;/);
+  assert.match(installer, /if IsAdmin and not ElevatedSessionConfirmed then\s+exit;/);
   assert.doesNotMatch(installer, /if IsAdminInstallMode then/);
   assert.match(installer, /当前安装程序是以管理员权限运行的/);
   assert.match(installer, /仍然继续安装/);
@@ -781,26 +781,18 @@ test('account cards keep the compact three-row layout', () => {
   // 账号页暂不展示“发起独立会话保持活跃”入口；daemon 接口保留供内部/后续流程使用。
   assert.doesNotMatch(script, /wbs-growth-activate/);
   assert.doesNotMatch(script, /api\('\/api\/growth\/activate'/);
-  assert.match(script, /expired \? '' : '<button class="wbs-icon-btn wbs-acc-switch"/);
-  assert.match(script, /switchBtn\.style\.display = hidden \|\| account\.creditExpired \? 'none' : ''/);
+  assert.match(script, /expired \|\| a\.authValid === false \? '' : '<button class="wbs-icon-btn wbs-acc-switch"/);
+  assert.match(script, /var invalidAuthBadge = a\.authValid === false/);
+  assert.match(script, /switchBtn\.style\.display = hidden \|\| account\.creditExpired \|\| account\.authValid === false \? 'none' : ''/);
   assert.match(script, /height:5px;min-height:5px/);
   assert.match(script, /\.wbs-credit-segment:first-child\{border-radius:3px 0 0 3px\}/);
   assert.match(script, /\.wbs-credit-segment:last-child\{border-radius:0 3px 3px 0\}/);
   assert.match(script, /cursor:default/);
   assert.doesNotMatch(script, /data-tip="' \+ attrTip \+ '" title=/);
-  assert.match(script, /diff <= day/);
-  assert.match(script, /diff <= 3 \* day/);
-  assert.match(script, /diff <= 7 \* day/);
-  assert.match(script, /diff <= 15 \* day/);
-  assert.match(script, /30 \* day/);
-  assert.match(script, /\.wbs-credit-segment\.safe\{background:rgba\(34,197,94,\.78\)/);
-  assert.match(script, /\.wbs-credit-segment\.within30\{background:rgba\(34,197,94,\.62\)/);
-  assert.match(script, /\.wbs-credit-segment\.within15\{background:rgba\(34,197,94,\.46\)/);
-  assert.match(script, /\.wbs-credit-segment\.within7\{background:rgba\(34,197,94,\.32\)/);
-  assert.match(script, /\.wbs-credit-segment\.within3\{background:rgba\(34,197,94,\.20\)/);
-  assert.match(script, /\.wbs-credit-segment\.within1\{background:rgba\(34,197,94,\.10\)/);
-  assert.match(script, /html\.cb-dark \.wbs-credit-segment\.safe\{background:rgba\(126,134,255,\.82\)/);
-  assert.match(script, /html\.cb-dark \.wbs-credit-segment\.within1\{background:rgba\(126,134,255,\.12\)/);
+  assert.match(script, /creditOpacity\(row\.days\)/);
+  assert.match(script, /creditOpacity\(segment\.expiresAt/);
+  assert.match(script, /background:rgba\(34,197,94,var\(--wbs-credit-alpha,1\)\)/);
+  assert.match(script, /background:rgba\(126,134,255,var\(--wbs-credit-alpha,1\)\)/);
   assert.match(script, /\.wbs-checkin-tag\.ok\{background:#edf9ef/);
   assert.match(script, /html\.cb-dark \.wbs-checkin-tag\.ok,html\[data-theme="dark"\] \.wbs-checkin-tag\.ok\{/);
   assert.match(script, /今日签到/);
@@ -826,7 +818,7 @@ test('account cards sort by credit expiry without pinning the current account', 
   assert.match(script, /state\.current = data\.current;\s*state\.accounts = mergeAccountSnapshot\(previous, data\.accounts \|\| \[\]\);/);
   // render()：不再把当前账号置顶，统一按积分到期时间升序
   assert.doesNotMatch(script, /state\.accounts\.sort\(function \(left, right\) \{[\s\S]*left\.uid === state\.current\.uid[\s\S]*right\.uid === state\.current\.uid[\s\S]*return leftIsCurrent \? -1 : 1;[\s\S]*\}\);/);
-  assert.match(script, /function render\(data\) \{[\s\S]*if \(!previous\.length \|\| !state\.open\) sortAccountsByCreditExpiry\(\);/);
+  assert.match(script, /function render\(data\) \{[\s\S]*if \(!previous\.length \|\| !state\.open \|\| currentChanged\) sortAccountsByCreditExpiry\(\);/);
   // sortAccountsByCreditExpiry：去掉当前账号置顶，仅按到期时间 + 稳定序
   assert.match(script, /function sortAccountsByCreditExpiry\(\) \{[\s\S]*isCurrent:[\s\S]*a\.expiresAt !== b\.expiresAt[\s\S]*a\.expiresAt - b\.expiresAt[\s\S]*a\.index - b\.index/);
   assert.doesNotMatch(script, /function sortAccountsByCreditExpiry\(\) \{[\s\S]*if \(a\.isCurrent !== b\.isCurrent\) return a\.isCurrent \? -1 : 1;/);
@@ -857,9 +849,8 @@ test('robot button decorations remain visible alongside the eye states', () => {
   const script = read('inject.js');
   assert.match(script, /wbs-fab-antenna/);
   assert.doesNotMatch(script, /wbs-fab-ear/); // 用户 08-30 00:37 要求去掉双耳
-  assert.match(script, /\.wbs-fab-antenna\{[^}]*background:rgba\(20,20,22,\.55\)[^}]*mask-image:url\("data:image\/svg\+xml/);
-  assert.match(script, /\.wbs-fab-antenna-dot\{[^}]*background:transparent/);
-  assert.match(script, /viewBox=\\'0 0 14 24\\'>/);
+  assert.match(script, /\.wbs-fab-antenna\{[^}]*background:var\(--wbs-robot-shell\)/);
+  assert.match(script, /\.wbs-fab-antenna-dot\{[^}]*background:var\(--wbs-robot-shell\)/);
   assert.match(script, /#wbs-fab-sleep-light\.sleep-on\{background:rgba\(46,229,157,\.85\)/);
   assert.match(script, /\.wbs-fab \.click > span:not\(\.wbs-fab-antenna\)\{display:none\}/);
   assert.doesNotMatch(script, /\.wbs-fab \.click span\{display:none\}/);
@@ -1087,6 +1078,8 @@ test('account export asks for a non-empty password and import supports an option
   assert.match(secureTransfer, /randomBytes\(16\)/);
   assert.match(daemon, /version:\s*2/);
   assert.match(daemon, /EXPORT_PASSPHRASE/);
+  assert.match(daemon, /const authRecord = parseAuthJson\(j\)/);
+  assert.match(daemon, /if \(!authRecord \|\| authRecord\.uid !== uid\) continue/);
   assert.match(inject, /title:\s*'导出账号'[\s\S]*requirePassword:\s*true/);
   assert.match(inject, /旧版导出文件可留空/);
   assert.match(inject, /type="password"/);

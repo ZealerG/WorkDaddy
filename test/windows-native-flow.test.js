@@ -81,7 +81,7 @@ test('WorkBuddy GUI startup stays visible while the watchdog stays hidden', () =
   assert.match(watchdog, /spawn\(process\.execPath, args, \{ stdio: 'ignore', windowsHide: true/);
 });
 
-test('installer confirms elevated setup but keeps lifecycle work and auto-launch standard-only', () => {
+test('installer keeps default lifecycle standard-only and gates the elevated session exception', () => {
   const installer = read('scripts/win/workdaddy.iss');
 
   assert.match(installer, /function EnsureWorkBuddyClosed/);
@@ -95,7 +95,7 @@ test('installer confirms elevated setup but keeps lifecycle work and auto-launch
   assert.match(installer, /if IsAdmin and not ConfirmElevatedInstall/);
   assert.match(installer, /MB_YESNO/);
   assert.match(installer, /IDYES/);
-  assert.match(installer, /if IsAdmin then\s+exit;/);
+  assert.match(installer, /if IsAdmin and not ElevatedSessionConfirmed then\s+exit;/);
   assert.doesNotMatch(installer, /if IsAdminInstallMode then/);
   assert.match(installer, /当前安装程序是以管理员权限运行的/);
   assert.match(installer, /ExecAsOriginalUser\(/);
@@ -205,6 +205,22 @@ test('native lifecycle cleanup accepts a PID that exits during exact inspection'
   const mismatch = source.indexOf('return false, exitIdentityMismatch', missingPath);
   assert.ok(missingPath >= 0 && exitedCheck > missingPath && mismatch > exitedCheck);
   assert.match(source.slice(exitedCheck, mismatch), /waitResult == waitObject0[\s\S]*return false, 0, nil/);
+});
+
+test('native lifecycle cleanup clears an access-denied PID that is absent from the process snapshot', () => {
+  const source = read('scripts/windows-native/main.go');
+  const inspectStart = source.indexOf('func inspectExactProcess(');
+  const inspectEnd = source.indexOf('\nfunc terminateExactProcess(', inspectStart);
+  assert.ok(inspectStart >= 0 && inspectEnd > inspectStart);
+  const inspect = source.slice(inspectStart, inspectEnd);
+  const denied = inspect.indexOf('errors.Is(err, syscall.ERROR_ACCESS_DENIED)');
+  const snapshot = inspect.indexOf('enumerateProcesses()', denied);
+  const absent = inspect.indexOf('if !present', snapshot);
+  const deniedResult = inspect.indexOf('return false, exitAccessDenied', absent);
+  assert.ok(denied >= 0, 'access-denied inspection must stay fail-closed');
+  assert.ok(snapshot > denied, 'access-denied inspection must refresh the process snapshot');
+  assert.ok(absent > snapshot && deniedResult > absent, 'only a PID absent from the snapshot may be treated as stale');
+  assert.match(inspect.slice(snapshot, deniedResult), /record\.PID == uint32\(pid\)[\s\S]*if !present[\s\S]*return false, 0, nil/);
 });
 
 test('elevated lifecycle cleanup inspects exact state before refusing active termination', () => {

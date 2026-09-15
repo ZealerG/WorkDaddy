@@ -149,6 +149,10 @@ function parseAuthFile(file, options = {}) {
   }
 }
 
+function parseAuthJson(json, options = {}) {
+  return authRecordFromJson(null, json, options);
+}
+
 function listAuthRecords() {
   if (!AUTH_FILE) return [];
   if (!DYNAMIC_AUTH_DISCOVERY) {
@@ -827,6 +831,7 @@ function normalizeAutoCopyLineages(dataDir) {
       }
       const replacementId = crypto.randomUUID();
       config.sessions[replacementId] = {
+        originLineageId: lineage.originLineageId || lineageId,
         enabled: lineage.enabled !== false,
         members: [{ uid, id }],
         createdAt: Date.now(),
@@ -944,42 +949,70 @@ function collectLineageMembersForDelete(dataDir, sessionIds) {
       .filter(Boolean)
   );
   if (!ids.size) return [];
-  // 跨账号全表反向索引：sessionId -> lineageId（会话 id 全局唯一）
-  const lineageBySession = new Map();
-  for (const owner of Object.keys(config.sessionIndex || {})) {
-    const index = config.sessionIndex[owner] || {};
-    for (const sessionId of Object.keys(index)) {
-      const lineageId = String(index[sessionId] || '');
-      if (lineageId) lineageBySession.set(sessionId, lineageId);
-    }
-  }
-  const members = [];
-  const seenKeys = new Set();
-  const seenLineages = new Set();
-  const addMember = (memberUid, memberId, lineageId) => {
+  // 成员表、反向索引及历史复制映射共同证明同源关系。只查成员表会漏掉
+  // 旧版复制记录，以及 normalizeAutoCopyLineages 拆出的重复物理会话。
+  // 不使用标题、工作目录或消息相似度推断，避免删除独立会话。
+  const membersByLineage = new Map();
+  const lineagesBySession = new Map();
+  const lineagesByOrigin = new Map();
+  const addLink = (lineageId, memberUid, memberId) => {
+    if (!config.sessions[lineageId]) return;
     const uid = String(memberUid || '').trim();
     const id = String(memberId || '').trim();
     if (!id) return;
-    const key = (uid || '*') + '::' + id;
-    if (seenKeys.has(key)) return;
-    seenKeys.add(key);
-    members.push({ uid, id, lineageId: String(lineageId || '') });
+    if (!membersByLineage.has(lineageId)) membersByLineage.set(lineageId, new Map());
+    membersByLineage.get(lineageId).set(id, { uid, id, lineageId });
+    if (!lineagesBySession.has(id)) lineagesBySession.set(id, new Set());
+    lineagesBySession.get(id).add(lineageId);
   };
+  for (const [lineageId, lineage] of Object.entries(config.sessions)) {
+    if (!lineage) continue;
+    const origin = String(lineage.originLineageId || lineageId);
+    if (!lineagesByOrigin.has(origin)) lineagesByOrigin.set(origin, []);
+    lineagesByOrigin.get(origin).push(lineageId);
+    for (const member of (Array.isArray(lineage.members) ? lineage.members : [])) {
+      addLink(lineageId, member && member.uid, member && member.id);
+    }
+  }
+  for (const [uid, index] of Object.entries(config.sessionIndex)) {
+    for (const [id, lineageId] of Object.entries(index || {})) addLink(String(lineageId || ''), uid, id);
+  }
+  for (const [key, mapping] of Object.entries(config.copies)) {
+    try {
+      const parts = JSON.parse(key);
+      if (Array.isArray(parts) && parts.length === 2) {
+        addLink(String(parts[0] || ''), parts[1], mapping && mapping.targetId);
+      }
+    } catch (_) { /* Malformed legacy keys cannot establish a copy relationship. */ }
+  }
+  const members = [];
+  const seenIds = new Set();
+  const seenLineages = new Set();
   for (const id of ids) {
-    const lineageId = lineageBySession.get(id);
-    if (!lineageId || !config.sessions[lineageId]) {
-      addMember('', id, '');
-      continue;
+    const pending = Array.from(lineagesBySession.get(id) || []);
+    if (!pending.length && !seenIds.has(id)) {
+      seenIds.add(id);
+      members.push({ uid: '', id, lineageId: '' });
     }
-    if (seenLineages.has(lineageId)) continue;
-    seenLineages.add(lineageId);
-    const lineage = config.sessions[lineageId];
-    const lineageMembers = Array.isArray(lineage.members) ? lineage.members : [];
-    if (!lineageMembers.length) {
-      addMember('', id, lineageId);
-      continue;
+    for (let i = 0; i < pending.length; i++) {
+      const lineageId = pending[i];
+      if (seenLineages.has(lineageId)) continue;
+      seenLineages.add(lineageId);
+      const lineage = config.sessions[lineageId];
+      const origin = String(lineage.originLineageId || lineageId);
+      for (const related of lineagesByOrigin.get(origin) || []) {
+        if (!seenLineages.has(related)) pending.push(related);
+      }
+      for (const member of (membersByLineage.get(lineageId) || new Map()).values()) {
+        if (!seenIds.has(member.id)) {
+          seenIds.add(member.id);
+          members.push(member);
+        }
+        for (const related of lineagesBySession.get(member.id) || []) {
+          if (!seenLineages.has(related)) pending.push(related);
+        }
+      }
     }
-    lineageMembers.forEach((m) => addMember(m && m.uid, m && m.id, lineageId));
   }
   return members;
 }
@@ -1182,6 +1215,7 @@ function updateMeta(dataDir, info, { preserveBinding = false } = {}) {
     authFileName,
     authDomain: info.authDomain || prev.authDomain || '',
     authIssuer: info.authIssuer || prev.authIssuer || '',
+    sort: Number.isSafeInteger(prev.sort) && prev.sort > 0 ? prev.sort : 0,
     firstSeen: prev.firstSeen || now,
     lastSeen: now,
   };
@@ -1265,6 +1299,30 @@ function resolveAuthTarget(dataDir, uid, authJson) {
   throw new Error('账号缺少已确认的登录文件名，拒绝猜测写入目标');
 }
 
+/** 账号展示顺序保存在 profile 元数据中，不改写登录备份格式。0 表示未排序，排在末尾。 */
+function getAccountOrder(dataDir) {
+  return { mode: readMeta(dataDir).accountOrderMode === 'fixed' ? 'fixed' : 'expiry' };
+}
+
+function setAccountOrder(dataDir, value) {
+  if (!value || !['expiry', 'fixed'].includes(value.mode) || !Array.isArray(value.uids) ||
+      value.uids.length > 10000 || value.uids.some(uid => typeof uid !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(uid)) ||
+      new Set(value.uids).size !== value.uids.length) throw new Error('无效的账号排序设置');
+  const current = new Set(listAccounts(dataDir).map(account => account.uid));
+  const meta = readMeta(dataDir);
+  for (const account of Object.values(meta.accounts)) {
+    if (account && typeof account === 'object') delete account.sort;
+  }
+  let sort = 0;
+  for (const uid of value.uids) {
+    if (!current.has(uid)) continue; // 弹窗打开后删除的账号不能复活。
+    meta.accounts[uid] = Object.assign({}, meta.accounts[uid], { sort: ++sort });
+  }
+  meta.accountOrderMode = value.mode;
+  writeMeta(dataDir, meta);
+  return getAccountOrder(dataDir);
+}
+
 /** 列出所有已备份账号（直接读备份文件提取展示字段，按最近刷新时间倒序） */
 function listAccounts(dataDir) {
   if (!ACTIVE_PROFILE.capabilities.accounts) return [];
@@ -1278,10 +1336,13 @@ function listAccounts(dataDir) {
   } catch (_) {
     /* 目录不存在 */
   }
+  const orderMeta = readMeta(dataDir);
   const list = names.map((n) => {
     const uid = n.replace(/\.info$/, '');
+    const savedSort = orderMeta.accounts[uid] && orderMeta.accounts[uid].sort;
     const item = {
       uid,
+      sort: Number.isSafeInteger(savedSort) && savedSort > 0 ? savedSort : 0,
       nickname: '',
       phone: '',
       uin: '',
@@ -1289,9 +1350,11 @@ function listAccounts(dataDir) {
       refreshExpiresAt: null,
       lastRefreshTime: null,
       lastSeen: null,
+      authValid: false,
     };
     try {
       const j = JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8'));
+      item.authValid = !!parseAuthJson(j);
       const acct = j.account || (Array.isArray(j.accounts) && j.accounts[0]);
       if (acct) {
         item.nickname = acct.nickname || '';
@@ -1459,11 +1522,17 @@ function switchTo(dataDir, uid, log = () => {}) {
 }
 
 module.exports = {
+  getAccountOrder,
+  setAccountOrder,
+  readModelsFile,
+  writeModelsFile,
+  writeModelBackup,
   AUTH_FILE,
   authDir,
   safeAuthFileName,
   normalizeAuthDomain,
   tokenIssuerOrigin,
+  parseAuthJson,
   parseAuthFile,
   listAuthRecords,
   resolveCurrentAuth,

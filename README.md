@@ -1,4 +1,4 @@
-# WorkDaddy
+<h1><img src="docs/images/workdaddy-app-icon-rounded.svg" alt="" width="40" height="40" align="absmiddle">&nbsp; WorkDaddy</h1>
 
 **语言：** [简体中文](README.md) · [English](README_en.md)
 
@@ -30,7 +30,9 @@
 - **方便切换账号**：每个 WorkBuddy 账号独立备份，点一下就切，再也不用每次扫码。
 - **无感登录新账号**：「登录新账号」支持免退出 OAuth 授权——不退出 WorkBuddy，在浏览器完成扫码后新账号自动加入列表；也可选传统的「假退出」方式回登录页扫码。
 - **账号导入导出**：把全部账号备份加密导出，在另一台电脑安装 WorkDaddy 后一键导入，方便电脑之间迁移账号。
-- **自动领每日积分**：由自动化任务管理多账号每日签到，缓存已完成状态，不打断你。
+- **自动领每日积分**：由自动化任务管理多账号每日签到，默认停用。首次打开面板会提示账号风险，选择开启后启用任务；开启或取消的选择保存在本机，之后不再提醒，可随时在「自动化」中手动启停。
+- **Token 和积分用量统计页面**：按天查看 Token 与积分消耗，支持按账号筛选，并显示模型和账号用量排行。
+- **积分不足时的账号切换建议**：当前账号积分不足时提示可用账号，方便继续工作。
 - **自动化任务**：用自然语言让 WorkBuddy 创建任务，或自行编辑步骤；支持手动、事件和定时触发，以及运行日志、停止任务和 JSON / ZIP 导入导出。
 - **权限弹窗免打扰**：真正的零决策弹窗弹出，可以放心开启任务后睡觉。
 - **暂存提示词**：输入框边上一键把草稿「暂存」到待发送队列——图片 / 文件 / 引用原样保留，择机发送。
@@ -206,7 +208,17 @@ WorkBuddy 右下角的机器人按钮 → 弹出面板 → 选你要的操作：
 - 本项目仅面向本机运行的 WorkBuddy 桌面端做界面与体验增强，**与 WorkBuddy 官方无隶属关系**。
 - WorkBuddy、其商标、官方资源归其权利人所有；本项目未获得其官方授权或认可。
 - 第三方主题、壁纸、背景图等素材仅作演示，商用前请自行确认权利。
+## Star History
 
+<a href="https://www.star-history.com/?repos=babygoton%2Fworkdaddy&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=babygoton/workdaddy&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=babygoton/workdaddy&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=babygoton/workdaddy&type=date&legend=top-left" />
+ </picture>
+</a>
+
+---
 ---
 
 ## 社区支持

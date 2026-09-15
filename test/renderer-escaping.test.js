@@ -49,7 +49,7 @@ test('session and account selectors escape every text and attribute sink', () =>
   assert.doesNotMatch(accountSelect, /'<option value="' \+ a\.uid/);
   assert.doesNotMatch(accountSelect, /\+ \(a\.nickname \|\|/);
 
-  const copyModal = sourceBetween('function openCopyModal(ids)', 'function openDeleteModal(ids)');
+  const copyModal = sourceBetween('function openCopyModal(ids)', 'function openDeleteModal(ids, allAccounts)');
   assert.match(copyModal, /'<option value="' \+ escAttr\(a\.uid\) \+ '">' \+ esc\(a\.nickname \|\| a\.uid\)/);
   assert.match(copyModal, /a\.phone \? '[^']*' \+ esc\(a\.phone\)/);
   assert.doesNotMatch(copyModal, /'<option value="' \+ a\.uid/);
@@ -86,8 +86,8 @@ test('model, wallpaper, and account cards escape each dynamic HTML sink', () => 
   assert.doesNotMatch(wallpapers, /(?:data-wp|title|data-src|alt)="' \+ (?:w\.|wallpaperUrl)/);
 
   const accounts = sourceBetween('function render(data)', 'function updateAccountSummary()');
-  assert.equal((accounts.match(/escAttr\(a\.uid\)/g) || []).length, 3);
-  assert.match(accounts, /data-primary-uid="' \+ escAttr\(a\.uid\)/);
+  assert.equal((accounts.match(/escAttr\(a\.uid\)/g) || []).length, 2);
+  assert.doesNotMatch(accounts, /data-primary-uid/);
   assert.equal((accounts.match(/escAttr\(a\.nickname \|\| '未命名'\)/g) || []).length, 2);
   assert.match(accounts, /var nameVal = state\.mask \? maskAccountName\(rawName\) : rawName;/);
   assert.match(accounts, /var idVal = state\.mask \? maskAccountId\(rawId\) : rawId;/);

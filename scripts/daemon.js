@@ -32,6 +32,7 @@ const { spawn, spawnSync } = require('child_process');
 const {
   assertSameProcessIdentity,
   detectWindowsPrivilege,
+  detectNativeWindowsPrivilege,
   buildNativeProcessQuery,
   filterVerifiedWindowsProcesses,
   filterVerifiedNodeProcesses,
@@ -42,7 +43,9 @@ const {
   selectPreferredDiscoveredBinary,
 } = require('./windows-process-boundary.js');
 const DAEMON_PRIVILEGE = process.platform === 'win32'
-  ? (process.env.WBSWITCH_NATIVE_LAUNCHER === '1' ? 'standard' : detectWindowsPrivilege())
+  ? (process.env.WBSWITCH_NATIVE_LAUNCHER === '1'
+    ? detectNativeWindowsPrivilege(path.resolve(__dirname, '..'), process.env.WBSWITCH_PROFILE || 'workbuddy-cn')
+    : detectWindowsPrivilege())
   : 'standard';
 // ws（WebSocketServer）用于 DevTools 代理：Electron 的 CDP server 拒绝带 Origin 的 WS 连接
 // （浏览器必带 Origin → DevTools 前端 "websocket disconnected"），daemon 代理中转去掉 Origin
@@ -72,6 +75,7 @@ const {
   logFile,
   ensureDirs,
   readAuthFile,
+  parseAuthJson,
   backupCurrent,
   listAccounts,
   switchTo,
@@ -111,11 +115,17 @@ const {
   enableModelBackup,
   importModels,
   checkinDisplayValue,
+  getAccountOrder,
+  setAccountOrder,
 } = require('./lib.js');
+const { createThirdPartyImport } = require('./third-party-models.js');
 const { extractCreditSegments, sortCreditSegments, mergeCreditSegments, parseEnterpriseUsage, ENTERPRISE_EDITIONS } = require('./credit-segments.js');
 const { buildCreditResourceBody } = require('./credit-resource-queries.js');
 const { fetchUsageSinceAnchor, startOfLocalDay } = require('./credit-request-usage.js');
+const { createCreditHistorySync, historyRange } = require('./credit-history-sync.js');
 const { createCreditUsageStore } = require('./credit-usage-store.js');
+const { scanTokenStatsCached, tokenStatsCacheReady } = require('./token-stats.js');
+const { initializeCheckinConsent, readCheckinConsent, decideCheckinConsent } = require('./checkin-consent.js');
 const { classifyCheckinResult, checkinEndpointsForToken } = require('./checkin-result.js');
 const {
   DAY_MS: TOKEN_REFRESH_DAY_MS,
@@ -131,6 +141,7 @@ const {
   telemetryEnabled,
   telemetryEnvironmentOverride,
 } = require('./sentry-report.js');
+const { createUsageReporter } = require('./usage-report.js');
 const { getProfile, profileDataDir, listInstalledModelSources } = require('./profiles.js');
 const { readWorkBuddyTarget } = require('./workbuddy-target.js');
 const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile } = require('./cdp-targets.js');
@@ -142,6 +153,8 @@ const {
   requiredPassword,
   resolveArchiveTarget,
 } = require('./secure-transfer.js');
+const { writeSessionTransfer, readSessionTransfer, receiveSessionUpload } = require('./session-transfer.js');
+const { pipeline: transferPipeline } = require('node:stream/promises');
 const { replaceFileWithRetry } = require('./atomic-file-write.js');
 const { parseUiPortState, profileUiPortCandidates } = require('./ui-port.js');
 const {
@@ -180,6 +193,7 @@ const { runCompletionReport, probeAccountCompletion } = require('./completion-re
 const { createPrimaryAccountStore } = require('./primary-account.js');
 const PROFILE = getProfile();
 const DATA_DIR = defaultDataDir();
+const thirdPartyModels = createThirdPartyImport({ targetFile: workbuddyModelsFile(), dataDir: DATA_DIR });
 const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.existsSync(accountBackupFile(uid)));
 // 版本号：改动 daemon/inject/theme-patches/builtin 资产后递增，launcher 检测到运行中版本不一致会强制用 app 内置代码重启
 // 0.6.6：品牌 HelloBuddy→WorkDaddy 期间版本号未递增，旧 HelloBuddy daemon 会被 launcher 误判为"同版本"而不重启，导致旧代码继续注入；递增后强制升级
@@ -330,8 +344,19 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 // 1.1.65：自动化会话发送前确保进入新版 WorkBuddy 新建任务页。
 // 1.1.66：新版侧栏 tab 共用 conversation-list-tab-button-box，改用文字确认新建任务。
 // 1.1.67：项目页存在普通 composer 时仍强制定位并点击新建任务 tab。
-const DAEMON_VERSION = '1.2.4';
-const DAEMON_BUILD_ID = 'release-1.2.4-20260908-send-button-poll-200ms';
+// 1.2.17：会话完成后的积分段轮换建议：刷新当前账号，候选账号只读内存缓存。
+// 1.2.18：Token 统计支持账号、模型、预设时间和日期范围筛选，诊断信息折叠展示。
+// 1.2.19：Token 历史统计落盘缓存，今日记录按文件变化增量更新。
+// 1.2.20：Token 查询收紧至 90 天，搜索使用固定尺寸蒙层并统一紧凑数字格式。
+// 1.2.21：Token 扫描从 sessions 表恢复日志账号归属并重建旧缓存，修复按账号筛选为空。
+// 1.2.22：Token 缓存改为日期/账号/模型聚合结果，打开面板时复用缓存并仅增量读取今日变更文件。
+// 1.2.23：临时支持会话完成后强制弹出账号切换提示，供交互验收。
+// 1.2.24：账号轮换恢复真实积分段消耗检测，仅推荐缓存中到期时间最近的可用账号。
+// 1.2.25：首页弹窗任务补齐成长/活动入口，并按 renderer 页面身份修复重连后的 pageReady 触发。
+// 1.2.26：无效账号备份不再显示可点击的切换按钮，导入路径拒绝写入无效认证数据。
+const DAEMON_VERSION = '1.2.42';
+const DAEMON_BUILD_ID = 'release-1.2.42-20260914-streaming-session-transfer';
+const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
@@ -349,11 +374,24 @@ const CDP_PORT_FILE = path.join(DATA_DIR, 'cdp-port.json');
 const UI_PORT_FILE = path.join(DATA_DIR, 'ui-port.json');
 const API_TOKEN_FILE = path.join(DATA_DIR, '.api-token');
 const BACKGROUND_BLUR_FILE = path.join(DATA_DIR, 'background-blur.json');
+const themeTextShadow = require('./theme-text-shadow.js').createThemeTextShadow(path.join(DATA_DIR, 'theme-text-shadow.json'));
 const MAX_BACKGROUND_BLUR_PX = 32;
 const CREDIT_USAGE_DB_FILE = path.join(DATA_DIR, 'credit-usage.db');
 const CREDIT_USAGE_STORE = createCreditUsageStore({ dbPath: CREDIT_USAGE_DB_FILE, profileId: PROFILE.id });
+const creditHistorySync = createCreditHistorySync({
+  cacheFile: path.join(DATA_DIR, 'credit-stats-cache.json'),
+  apiHost: PROFILE.apiHost,
+  getAccessToken: async (uid) => {
+    const refreshed = await refreshAccountBackupToken(uid);
+    if (refreshed.error || !refreshed.root) throw new Error('账号凭据不可用');
+    const auth = refreshed.root.auth || {};
+    return auth.accessToken || auth.access_token || auth.token;
+  },
+});
 const CREDIT_USAGE_REFRESH_MS = 15000;
 const creditUsageSyncInFlight = new Map();
+const { selectRotationCandidate } = require('./credit-rotation.js');
+const creditRotationCache = new Map();
 const WATCH_INTERVAL = 3000; // 文件监听兜底
 const BACKUP_DEBOUNCE = 1500; // CDP 事件触发的备份防抖
 const CDP_RECONNECT_MS = 5000;
@@ -977,7 +1015,7 @@ function validateUpdateArtifact(file, expectSha = null) {
 
 // ---------------------------------------------------------------------------
 // 无感登录（OAuth state 轮询采集，流程与 workbuddy-switch 一致）：
-//   1. POST /v2/plugin/auth/state?platform=workbuddy 申请 state + 授权链接
+//   1. POST /v2/plugin/auth/state?platform=<客户端标识> 申请 state + 授权链接
 //   2. 用户在系统浏览器完成扫码授权（WorkBuddy 全程不退出）
 //   3. 轮询 GET /v2/plugin/auth/token?state=... 拿 accessToken
 //   4. GET /v2/plugin/login/account?state=... 拉账号信息，拼成官方认证文件结构入库
@@ -1588,6 +1626,7 @@ let manualInjectPromise = null; // launcher 超时重试时复用同一轮注入
 let pendingReloadInjection = null; // 仅对 WorkDaddy 主动触发的页面重载做一次主 frame 早期注入
 let mainFrameNavigationSerial = 0;
 let suppressPageLoadInjectionForNavigation = 0;
+let cdpPageSessionId = '';
 const automationEventKeys = new Set();
 let pendingAutomationAccountSwitch = null;
 
@@ -1832,6 +1871,9 @@ async function connectCdp() {
       cdp.error = null;
       cdp.targetUrl = target.url || '';
       cdp.targetTitle = target.title || '';
+      // Target ids survive a transient WebSocket reconnect but change with a
+      // restarted renderer, unlike the navigation serial missed while offline.
+      cdpPageSessionId = String(target.id || target.webSocketDebuggerUrl || 'unknown');
       log(`[cdp] 已连接 WorkBuddy (port=${cdp.port}, target=${cdp.targetUrl})`);
       // 打开感兴趣的能力域
       cdpSend('Page.enable').catch(() => {});
@@ -1847,11 +1889,8 @@ async function connectCdp() {
         // 恢复已保存的主题（页面刷新/WorkBuddy 重启后 WorkBuddy 回到官方浅色，
         // 这里重新应用，保证「WorkDaddy 主题=深色 / WorkBuddy 默认主题=浅色」在重启后仍生效）
         restoreSavedTheme().catch((e) => log(`[theme] 恢复主题失败: ${e.message}`));
-        // 某些旧版 renderer 在 daemon 连接后不会再发送 loadEventFired；
-        // readyState 已完成时补发一次首屏生命周期事件，按导航序号去重。
-        cdpSend('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }).then((r) => {
-          if (r && r.result && r.result.value === 'complete') dispatchAutomationEvent('pageReady', { navigationSerial: mainFrameNavigationSerial, source: 'connect' });
-        }).catch(() => {});
+        // 连接可能发生在 loadEventFired 之后，也可能正好处于页面加载中。
+        waitForPageReadyThenDispatch(cdpPageSessionId);
       }, 1200);
       resolve(true);
     };
@@ -1887,11 +1926,27 @@ async function connectCdp() {
   });
 }
 
+function waitForPageReadyThenDispatch(pageSessionId, attempt = 0) {
+  if (!cdp.connected || pageSessionId !== cdpPageSessionId) return;
+  const retry = () => {
+    if (attempt < 20) setTimeout(() => waitForPageReadyThenDispatch(pageSessionId, attempt + 1), 500);
+  };
+  cdpSend('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }).then((response) => {
+    if (!cdp.connected || pageSessionId !== cdpPageSessionId) return;
+    if (response && response.result && response.result.value === 'complete') {
+      dispatchAutomationEvent('pageReady', { navigationSerial: mainFrameNavigationSerial, pageSessionId, source: 'connect' });
+      return;
+    }
+    retry();
+  }).catch(retry);
+}
+
 function dispatchAutomationEvent(type, detail = {}) {
   const eventType = String(type || '').trim();
   if (!['pageReady', 'pageLoaded', 'accountSwitched', 'panelOpened'].includes(eventType)) return;
   const canonicalType = eventType === 'pageReady' ? 'pageReady' : eventType;
-  const key = canonicalType + ':' + String(detail.navigationSerial == null ? mainFrameNavigationSerial : detail.navigationSerial);
+  const pageSessionId = String(detail.pageSessionId || cdpPageSessionId || 'unknown');
+  const key = canonicalType + ':' + pageSessionId + ':' + String(detail.navigationSerial == null ? mainFrameNavigationSerial : detail.navigationSerial);
   if (canonicalType === 'pageReady' && automationEventKeys.has(key)) return;
   if (canonicalType === 'pageReady') {
     automationEventKeys.add(key);
@@ -1902,10 +1957,10 @@ function dispatchAutomationEvent(type, detail = {}) {
   const account = detail.account || currentAccount();
   tasks.forEach((task) => {
     try {
-      const event = { type: canonicalType, navigationSerial: detail.navigationSerial == null ? mainFrameNavigationSerial : detail.navigationSerial, source: detail.source || 'cdp', account: account ? { uid: account.uid, nickname: account.nickname } : null };
+      const event = { type: canonicalType, navigationSerial: detail.navigationSerial == null ? mainFrameNavigationSerial : detail.navigationSerial, pageSessionId, source: detail.source || 'cdp', account: account ? { uid: account.uid, nickname: account.nickname } : null };
       const run = Array.from(automationRuns.values()).find((item) => item.taskId === task.id && item.status === 'running');
       if (run) {
-        if (task.trigger.restartOnNavigation && run.navigationSerial !== event.navigationSerial) {
+        if (task.trigger.restartOnNavigation && (run.navigationSerial !== event.navigationSerial || run.pageSessionId !== event.pageSessionId)) {
           run.superseded = true;
           run.pendingEvent = event;
         }
@@ -2758,7 +2813,9 @@ async function automationDomAction(op, locator, detail) {
     assertActive();
     if (found.blocked) throw new Error('页面元素被遮挡或禁用，稍后重试');
     const x = found.x + found.w / 2; const y = found.y + found.h / 2;
-    await cdpMouseClick('dom.click:' + String(locator && locator.value || ''), x, y, { op, found }, { skipMove: locator && locator.visible === true });
+    const locators = Array.isArray(locator) ? locator : [locator];
+    const locatorLabel = locators.map((item) => item && item.value || '').filter(Boolean).join(' | ');
+    await cdpMouseClick('dom.click:' + locatorLabel, x, y, { op, found }, { skipMove: locators.some((item) => item && item.visible === true) });
     return found;
   }
   const focus = `(function(){var el=${expr};if(!el)return false;el.focus();return true})()`;
@@ -2905,7 +2962,7 @@ function automationSwitchAccount(account) {
   return run;
 }
 function startAutomationRun(task, event = null) {
-  if (event && event.navigationSerial == null) event = { ...event, navigationSerial: mainFrameNavigationSerial };
+  if (event && (event.navigationSerial == null || event.pageSessionId == null)) event = { ...event, navigationSerial: event.navigationSerial == null ? mainFrameNavigationSerial : event.navigationSerial, pageSessionId: event.pageSessionId || cdpPageSessionId };
   if (automationRuns.size > 200) {
     for (const [key, value] of automationRuns) {
       if (value.status !== 'running') automationRuns.delete(key);
@@ -2913,9 +2970,9 @@ function startAutomationRun(task, event = null) {
     }
   }
   const id = 'run_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
-  const run = { id, taskId: task.id, status: 'running', startedAt: Date.now(), finishedAt: 0, error: '', logs: [], result: null, navigationSerial: event && event.navigationSerial };
+  const run = { id, taskId: task.id, status: 'running', startedAt: Date.now(), finishedAt: 0, error: '', logs: [], result: null, navigationSerial: event && event.navigationSerial, pageSessionId: event && event.pageSessionId };
   const isCancelled = () => run.status === 'cancelled' || run.superseded === true ||
-    (task.trigger.restartOnNavigation && event && event.navigationSerial !== mainFrameNavigationSerial);
+    (task.trigger.restartOnNavigation && event && (event.navigationSerial !== mainFrameNavigationSerial || event.pageSessionId !== cdpPageSessionId));
   log('[automation-focus-diagnostics] automation:start ' + JSON.stringify({ runId: id, taskId: task.id, source: event && event.source || '', account: event && event.account || null, cdpTargetUrl: cdp.targetUrl, cdpTargetTitle: cdp.targetTitle }));
   const appendRunLog = (message) => {
     run.logs.push({ at: Date.now(), message: String(message || '').slice(0, 300) });
@@ -3048,7 +3105,7 @@ function startAutomationRun(task, event = null) {
     if (!account || !account.uid) throw new Error('没有可用账号');
     const result = await claimDailyForUid(account.uid);
     appendRunLog('account:checkin:' + (result.skipped ? 'skipped' : result.ok ? 'success' : 'failed'));
-    if (result.ok && !result.skipped && cdp.connected) cdpSend('Runtime.evaluate', { expression: "window.dispatchEvent(new CustomEvent('workdaddy:accounts-updated'))" }).catch(() => {});
+    if (cdp.connected) cdpSend('Runtime.evaluate', { expression: "window.dispatchEvent(new CustomEvent('workdaddy:accounts-updated'))" }).catch(() => {});
     return result;
   }, httpRequest: automationHttpRequest, domAction: (op, locator, detail) => ['dom.click','dom.type','dom.clear','dom.press'].includes(op) ? withInput(() => automationDomAction(op, locator, { ...detail, isCancelled })) : automationDomAction(op, locator, { ...detail, isCancelled }), sessionSendCurrent, sessionWaitReply, getState: runScopedState, setState: setRunState, isCancelled, notifyToast: async (level, message, detail) => { const result = await runNotifier.show(level, message, detail); appendRunLog('notify:toast:' + level); return result; }, notifySession: async () => { throw new Error('主账号会话通知尚未启用，请先验证 WorkBuddy 会话 API'); }, log: appendRunLog };
   // 等「收起面板」完成后才开始执行任务（executeTask 内部第一步就点新建任务/聚焦 composer，
@@ -3056,15 +3113,22 @@ function startAutomationRun(task, event = null) {
   run.completion = panelPrepare
     .then(() => executeTask(task, runDeps))
     .then(async (result) => { if (isCancelled()) throw new Error('任务已停止'); if (run.wasPanelOpen) await automationPanelSetOpen(true); if (run.status === 'running') { run.status = 'success'; run.result = result; run.finishedAt = Date.now(); } log('[automation-focus-diagnostics] automation:finish ' + JSON.stringify({ runId: id, status: run.status, error: run.error })); })
-    .catch(async (error) => { if (run.wasPanelOpen && !run.superseded && (!task.trigger.restartOnNavigation || !event || event.navigationSerial === mainFrameNavigationSerial)) await automationPanelSetOpen(true); run.status = isCancelled() ? 'cancelled' : 'failed'; run.error = run.superseded ? '页面已切换，重新检测新页面' : String(error && error.message || error); run.finishedAt = Date.now(); appendRunLog(run.error); log('[automation-focus-diagnostics] automation:finish ' + JSON.stringify({ runId: id, status: run.status, error: run.error })); })
-    .finally(async () => { try { await runNotifier.cleanup(); } finally { releaseRenderer(); resumeAutomationAfterNavigation(run); } });
+    .catch(async (error) => { if (run.wasPanelOpen && !run.superseded && (!task.trigger.restartOnNavigation || !event || event.navigationSerial === mainFrameNavigationSerial && event.pageSessionId === cdpPageSessionId)) await automationPanelSetOpen(true); run.status = isCancelled() ? 'cancelled' : 'failed'; run.error = run.superseded ? '页面已切换，重新检测新页面' : String(error && error.message || error); run.finishedAt = Date.now(); appendRunLog(run.error); log('[automation-focus-diagnostics] automation:finish ' + JSON.stringify({ runId: id, status: run.status, error: run.error })); })
+    .finally(async () => {
+      // Include cached/skipped results and refresh once after the whole run so an
+      // earlier account snapshot cannot leave the open panel with stale badges.
+      if (task.id === 'daily-account-checkin' && cdp.connected) {
+        cdpSend('Runtime.evaluate', { expression: "window.dispatchEvent(new CustomEvent('workdaddy:accounts-updated'))" }).catch(() => {});
+      }
+      try { await runNotifier.cleanup(); } finally { releaseRenderer(); resumeAutomationAfterNavigation(run); }
+    });
   return run;
 }
 
 function resumeAutomationAfterNavigation(run) {
   const next = run.pendingEvent;
   run.pendingEvent = null;
-  if (!next || next.navigationSerial !== mainFrameNavigationSerial) return;
+  if (!next || next.navigationSerial !== mainFrameNavigationSerial || next.pageSessionId !== cdpPageSessionId) return;
   const task = readAutomations(DATA_DIR).find((item) => item.id === run.taskId && item.enabled && item.trigger.restartOnNavigation);
   if (task) startAutomationRun(task, next);
 }
@@ -3374,6 +3438,8 @@ function buildInjectScript() {
     .replace(/__WBS_DIAGNOSTICS_ENABLED__/g, diagnosticsEnabled() ? 'true' : 'false')
     .replace(/__WBS_PROFILE__/g, PROFILE.id)
     .replace(/__WBS_CAPS__/g, JSON.stringify(PROFILE.capabilities))
+    .replace(/__WBS_AVATAR_LOGO__/g, 'data:image/svg+xml;base64,' + fs.readFileSync(path.join(__dirname, 'assets', 'workdaddy-app-icon-source.svg')).toString('base64'))
+    .replace(/__WBS_LOGO__/g, 'data:image/svg+xml;base64,' + fs.readFileSync(path.join(__dirname, 'assets', 'workdaddy-logo.svg')).toString('base64'))
     .replace(/__WBS_PLATFORM__/g, JSON.stringify(process.platform));
 }
 
@@ -3599,7 +3665,7 @@ function sessionRangeMs(range) {
 // tasks/<id>/、file-history/<id>/、artifact-index/<id>.json（全部以新 id 命名复制）
 // 异步实现：切号复制大批会话时，同步 cpSync 会阻塞主线程几十秒，把注入定时器、
 // 面板响应全部饿死（切号后 FAB 迟迟不出现的根因之一）。
-async function copySessionFiles(wbHome, oldId, newId) {
+async function copySessionFiles(wbHome, oldId, newId, lineageIds = []) {
   const fsMod = fs;
   const result = { copied: 0, failed: 0 };
   const copyOne = async (from, to) => {
@@ -3607,6 +3673,7 @@ async function copySessionFiles(wbHome, oldId, newId) {
       if (!fsMod.existsSync(from)) return;
       const fromResolved = path.resolve(from);
       const toResolved = path.resolve(to);
+      if (fromResolved === toResolved) return;
       const relative = path.relative(fromResolved, toResolved);
       const targetInsideSource = relative && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
       if (targetInsideSource) {
@@ -3614,7 +3681,7 @@ async function copySessionFiles(wbHome, oldId, newId) {
         return;
       }
       fsMod.mkdirSync(path.dirname(to), { recursive: true });
-      await fsMod.promises.cp(from, to, { recursive: true, force: true });
+      await fsMod.promises.cp(from, to, { recursive: true, force: true, preserveTimestamps: true });
       result.copied++;
     } catch (e) {
       result.failed++;
@@ -3641,7 +3708,49 @@ async function copySessionFiles(wbHome, oldId, newId) {
   // 4) file-history/<id>/
   await copyOne(path.join(wbHome, 'file-history', oldId), path.join(wbHome, 'file-history', newId));
   // 5) artifact-index/<id>.json
-  await copyOne(path.join(wbHome, 'artifact-index', oldId + '.json'), path.join(wbHome, 'artifact-index', newId + '.json'));
+  // 官方按 _meta.ownerConversationId 校验跨工作目录交付文件。仅重映射确属源会话的 owner，
+  // 保留 requestId/URI/其他会话归属；原样 cp 会让目标会话过滤掉这些产物。
+  const fromIndex = path.join(wbHome, 'artifact-index', oldId + '.json');
+  const toIndex = path.join(wbHome, 'artifact-index', newId + '.json');
+  if (fsMod.existsSync(fromIndex)) {
+    let temporary;
+    try {
+      const stat = await fsMod.promises.stat(fromIndex);
+      if (stat.size > 16 * 1024 * 1024) throw new Error('产物索引超过 16MB，未覆盖目标索引');
+      const original = await fsMod.promises.readFile(fromIndex, 'utf8');
+      let index;
+      try { index = JSON.parse(original); }
+      catch (_) { throw new Error('产物索引格式不受支持'); }
+      const artifacts = Array.isArray(index) ? index : index && index.artifacts;
+      if (!Array.isArray(artifacts)) throw new Error('产物索引格式不受支持');
+      const owners = new Set([oldId, ...lineageIds]);
+      let changed = false;
+      for (const artifact of artifacts) {
+        if (artifact && artifact._meta && owners.has(artifact._meta.ownerConversationId) && artifact._meta.ownerConversationId !== newId) {
+          changed = true;
+          artifact._meta.ownerConversationId = newId;
+        }
+      }
+      if (oldId === newId && !changed) return result;
+      await fsMod.promises.mkdir(path.dirname(toIndex), { recursive: true });
+      temporary = await fsMod.promises.mkdtemp(path.join(path.dirname(toIndex), '.wbs-artifact-'));
+      const staged = path.join(temporary, 'index.json');
+      await fsMod.promises.writeFile(staged, JSON.stringify(index), { mode: stat.mode & 0o777, flag: 'wx' });
+      // 复制时间不能伪装成新内容，否则下一次切号会错选较旧的副本为同步来源。
+      await fsMod.promises.utimes(staged, stat.atime, stat.mtime);
+      // 就地修复旧来源时，官方进程若已落盘新产物，保留它的新内容供下次同步。
+      if (oldId === newId && await fsMod.promises.readFile(fromIndex, 'utf8') !== original) {
+        throw new Error('产物索引已变化，请重试同步');
+      }
+      await fsMod.promises.rename(staged, toIndex);
+      result.copied++;
+    } catch (error) {
+      result.failed++;
+      log('[sessions-copy] 产物索引复制失败: ' + error.message);
+    } finally {
+      if (temporary) await fsMod.promises.rm(temporary, { recursive: true, force: true });
+    }
+  }
   log('[sessions-copy] 已复制消息文件 ' + oldId + ' -> ' + newId);
   return result;
 }
@@ -3716,11 +3825,14 @@ async function syncAutoCopyLineage(lineageId, targetUid) {
   if (!latest) return { members: live.length, synced: 0, failedFiles: 0, targetIds, targetPresent };
   const sourceRow = latest.row;
   let synced = 0;
-  let failedFiles = 0;
+  const ownerIds = records.map((member) => member.id);
+  // 旧版副本可能仍挂着最初源会话的 owner；也修复作为最新来源的副本自身。
+  const repairedSource = await copySessionFiles(PROFILE.dataRoot, latest.id, latest.id, ownerIds);
+  let failedFiles = repairedSource.failed;
   for (const target of live) {
     if (target.id === latest.id) continue;
     await yieldAutoCopyToRenderer();
-    const files = await copySessionFiles(PROFILE.dataRoot, latest.id, target.id);
+    const files = await copySessionFiles(PROFILE.dataRoot, latest.id, target.id, ownerIds);
     synced++;
     failedFiles += files.failed;
     try {
@@ -3737,7 +3849,6 @@ async function syncAutoCopyLineage(lineageId, targetUid) {
   return { members: live.length, synced, failedFiles, sourceId: latest.id, targetIds, targetPresent };
 }
 
-const MAX_SESSION_EXPORT_BYTES = 256 * 1024 * 1024;
 const MAX_SESSION_EXPORT_FILES = 20000;
 const MAX_SESSION_IMPORT_ERRORS = 20;
 const MAX_SESSION_IMPORT_ERROR_LENGTH = 240;
@@ -3759,7 +3870,6 @@ function archiveRelativePath(wbHome, target) {
 function collectSessionArchiveFiles(wbHome, sessionId) {
   if (!isValidSessionId(sessionId)) throw new Error('无效的会话 ID');
   const files = [];
-  let totalBytes = 0;
   const collect = (target) => {
     let stat;
     try { stat = fs.lstatSync(target); }
@@ -3775,14 +3885,10 @@ function collectSessionArchiveFiles(wbHome, sessionId) {
     }
     if (!stat.isFile()) return;
     if (files.length >= MAX_SESSION_EXPORT_FILES) throw new Error('会话附件文件过多，无法导出');
-    if (totalBytes + stat.size > MAX_SESSION_EXPORT_BYTES) throw new Error('会话附件超过 256 MB，无法导出');
     const relative = archiveRelativePath(wbHome, target);
     // Validate every exported path with the same mapper used during import.
     remapSessionArchivePath(relative, sessionId, sessionId);
-    const content = fs.readFileSync(target);
-    totalBytes += content.length;
-    if (totalBytes > MAX_SESSION_EXPORT_BYTES) throw new Error('会话附件超过 256 MB，无法导出');
-    files.push({ path: relative, data: content.toString('base64') });
+    files.push({ path: relative, source: target, size: stat.size });
   };
 
   const projects = path.join(wbHome, 'projects');
@@ -3828,7 +3934,6 @@ function restoreSessionArchiveFiles(wbHome, sessionArchive, newId) {
   if (!isValidSessionId(oldId) || !isValidSessionId(newId)) throw new Error('会话归档包含无效 ID');
   const sourceFiles = Array.isArray(sessionArchive.files) ? sessionArchive.files : [];
   if (sourceFiles.length > MAX_SESSION_EXPORT_FILES) throw new Error('会话归档附件文件过多');
-  let totalBytes = 0;
   const targets = new Set();
   for (const entry of sourceFiles) {
     if (!entry || typeof entry.path !== 'string' || typeof entry.data !== 'string' || entry.data.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(entry.data)) {
@@ -3839,12 +3944,26 @@ function restoreSessionArchiveFiles(wbHome, sessionArchive, newId) {
     if (targets.has(target)) throw new Error('会话归档包含重复附件路径');
     targets.add(target);
     const content = Buffer.from(entry.data, 'base64');
-    totalBytes += content.length;
-    if (totalBytes > MAX_SESSION_EXPORT_BYTES) throw new Error('会话归档附件超过 256 MB');
     ensureArchiveParentNoFollow(wbHome, target);
     fs.writeFileSync(target, content, { flag: 'wx', mode: 0o600 });
   }
   return sourceFiles.length;
+}
+
+// Only readSessionTransfer creates these private staging paths. Never accept them
+// from a JSON API payload or an unverified archive entry.
+async function restoreStagedSessionArchiveFiles(wbHome, archive, newId) {
+  const oldId = String(archive.record.id);
+  const targets = new Set();
+  for (const entry of archive.files) {
+    const relative = remapSessionArchivePath(entry.path, oldId, newId);
+    const target = resolveArchiveTarget(wbHome, relative);
+    if (targets.has(target)) throw new Error('会话归档包含重复附件路径');
+    targets.add(target);
+    ensureArchiveParentNoFollow(wbHome, target);
+    await fs.promises.copyFile(entry.source, target, fs.constants.COPYFILE_EXCL);
+    await fs.promises.chmod(target, 0o600);
+  }
 }
 
 const SESSION_COPY_COLUMNS = [
@@ -3909,13 +4028,15 @@ async function exportSessions(ids, password) {
     return { record, files: collectSessionArchiveFiles(wbHome, id) };
   });
   if (!sessions.length) throw new Error('没有可导出的会话');
-  const payload = { exportType: 'WorkDaddy-sessions', version: 1, sessions };
-  const content = createEncryptedExport('sessions', payload, password);
-  return {
-    filename: 'WorkDaddy-会话导出-' + new Date().toISOString().slice(0, 10) + '.json',
-    content,
-    count: sessions.length,
-  };
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'workdaddy-session-export-'));
+  const file = path.join(directory, 'sessions.wds');
+  try {
+    await writeSessionTransfer(file, sessions, password);
+    return { file, directory, count: sessions.length };
+  } catch (error) {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 function validImportedSessionUid(value) {
@@ -3925,7 +4046,10 @@ function validImportedSessionUid(value) {
 }
 
 async function importSessions(content, password, targetUid) {
-  const payload = openEncryptedExport(content, 'sessions', password);
+  return importSessionArchives(openEncryptedExport(content, 'sessions', password), targetUid);
+}
+
+async function importSessionArchives(payload, targetUid, staged = false) {
   const archives = Array.isArray(payload.sessions) ? payload.sessions : [];
   if (!archives.length) throw new Error('导入文件中没有会话数据');
   if (archives.length > 100) throw new Error('单次最多导入 100 个会话');
@@ -3942,7 +4066,8 @@ async function importSessions(content, password, targetUid) {
     catch (error) { errors.push(error.message); continue; }
     const newId = crypto.randomUUID();
     try {
-      restoreSessionArchiveFiles(PROFILE.dataRoot, archive, newId);
+      if (staged) await restoreStagedSessionArchiveFiles(PROFILE.dataRoot, archive, newId);
+      else restoreSessionArchiveFiles(PROFILE.dataRoot, archive, newId);
       await insertCopiedSession(record, ownerUid, newId);
       imported.push({ sourceId: oldId, id: newId, uid: ownerUid });
     } catch (error) {
@@ -3963,6 +4088,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
   if (!lineageId && sourceLineage.enabled) lineageId = sourceLineage.lineageId;
   if (auto && sourceUid && !lineageId) lineageId = ensureAutoCopySession(DATA_DIR, sourceUid, src.id);
   const perform = async () => {
+  const ownerIds = lineageId ? getAutoCopySessionMemberRecords(DATA_DIR, lineageId).map((member) => member.id) : [];
   if (sourceUid && lineageId) {
     const mapping = getAutoCopyMapping(DATA_DIR, lineageId, targetUid);
     if (mapping && mapping.targetId) {
@@ -3971,7 +4097,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
         [mapping.targetId]
       );
       if (existing.length && String(existing[0].user_id || '') === String(targetUid)) {
-        const files = await copySessionFiles(wbHome, src.id, mapping.targetId);
+        const files = await copySessionFiles(wbHome, src.id, mapping.targetId, ownerIds);
         addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, mapping.targetId);
         setAutoCopyMapping(DATA_DIR, lineageId, targetUid, {
           targetId: mapping.targetId,
@@ -4010,7 +4136,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
       });
       if (candidates.length) {
         const canonicalId = candidates[0].id;
-        const files = await copySessionFiles(wbHome, src.id, canonicalId);
+        const files = await copySessionFiles(wbHome, src.id, canonicalId, ownerIds);
         addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, canonicalId);
         setAutoCopyMapping(DATA_DIR, lineageId, targetUid, {
           targetId: canonicalId,
@@ -4024,7 +4150,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
 
   const newId = crypto.randomUUID();
   await insertCopiedSession(src, targetUid, newId);
-  const files = await copySessionFiles(wbHome, src.id, newId);
+  const files = await copySessionFiles(wbHome, src.id, newId, ownerIds);
   if (lineageId) {
     addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, newId);
     setAutoCopyMapping(DATA_DIR, lineageId, targetUid, {
@@ -4279,11 +4405,47 @@ function isManagedDirectoryNoFollow(wbHome, directory) {
   return true;
 }
 
+// app/sessions.json 是共享窗口缓存，只移除所选会话的条目，不删除整个文件或 app 目录。
+function removeSessionAppCache(wbHome, id) {
+  const appDir = path.join(wbHome, 'app');
+  if (!isManagedDirectoryNoFollow(wbHome, appDir)) return false;
+  const file = resolveManagedSessionTarget(appDir, 'sessions.json');
+  let stat;
+  try { stat = fs.lstatSync(file); }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('会话缓存必须是普通文件');
+  const original = fs.readFileSync(file, 'utf8');
+  let data;
+  try { data = JSON.parse(original); }
+  catch (_) { throw new Error('会话缓存无法解析，请稍后重试'); }
+  const entries = Array.isArray(data) ? data : data && data.sessions;
+  if (!Array.isArray(entries)) throw new Error('会话缓存格式不受支持，未改写缓存');
+  const kept = entries.filter((entry) => !entry || entry.conversationId !== id);
+  if (kept.length === entries.length) return false;
+  const next = Array.isArray(data) ? kept : Object.assign({}, data, { sessions: kept });
+  const tempDir = fs.mkdtempSync(path.join(appDir, '.wbs-session-cache-'));
+  try {
+    const temp = path.join(tempDir, 'sessions.json');
+    fs.writeFileSync(temp, JSON.stringify(next, null, 2) + '\n', { mode: stat.mode & 0o777, flag: 'wx' });
+    // 官方进程若已改写缓存，保留最新文件和 DB 重试锚点，不能覆盖它的新内容。
+    if (fs.lstatSync(file).isSymbolicLink() || fs.readFileSync(file, 'utf8') !== original) {
+      throw new Error('会话缓存已变化，请重试删除');
+    }
+    fs.renameSync(temp, file);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  return true;
+}
+
 // 真实删除会话的消息文件：projects/<项目>/<id>.jsonl + <id>/、workspace/sessions/<id>/、
 // tasks/<id>/、file-history/<id>/、artifact-index/<id>.json（全部按会话 id 精确删除，不可恢复）
 function deleteSessionFiles(wbHome, id) {
   if (!isValidSessionId(id)) throw new Error('无效的会话 ID');
-  let removed = 0;
+  // 配置的数据根允许是 Windows junction；仅解析这一层，内部 managed parent 仍逐级拒绝链接。
+  try { wbHome = fs.realpathSync(wbHome); }
+  catch (error) { if (error.code === 'ENOENT') return 0; throw error; }
+  let removed = removeSessionAppCache(wbHome, id) ? 1 : 0;
   const delOne = (parent, leaf) => {
     let target;
     try {
@@ -5345,7 +5507,8 @@ function initBuiltinAssets() {
 
 /** 内置主题（默认 + 3 套示例） */
 const BUILTIN_THEMES = {
-  default: { id: 'default', name: '默认（浅色）', author: 'WorkBuddy', dark: false, colors: {} },
+  default: { id: 'default', name: '浅色', author: 'WorkBuddy', dark: false, colors: {} },
+  dark: { id: 'dark', name: '深色', author: 'WorkBuddy', dark: true, colors: {} },
   'oled-dark': {
     id: 'oled-dark', name: 'OLED 纯黑', author: 'wbs', dark: true,
     colors: {
@@ -5523,7 +5686,7 @@ function listThemes() {
           if (!fs.statSync(flatPath).isDirectory() || !fs.existsSync(subPath)) continue;
           try { t = JSON.parse(fs.readFileSync(subPath, 'utf8')); } catch (_) { continue; }
         }
-        if (!t || !t.id || !t.colors) continue;
+        if (!t || !t.id || !t.colors || t.id === 'default' || t.id === 'dark') continue;
         const existing = themes.findIndex((x) => x.id === t.id);
         const item = { id: t.id, name: t.name || t.id, author: t.author || 'unknown', dark: !!t.dark, builtin: false };
         if (existing >= 0) themes[existing] = item; // 覆盖内置
@@ -5536,6 +5699,8 @@ function listThemes() {
 
 /** 取主题完整定义（含 colors）。优先读 themes/ 目录的自定义文件（可覆盖内置同名主题），否则回退内置 */
 function getTheme(id) {
+  // 浅色/深色始终对应官方外观，不允许同名自定义文件改变其语义。
+  if (id === 'default' || id === 'dark') return BUILTIN_THEMES[id];
   // 先查文件（用户自定义或覆盖内置的完整版）——支持 themes/<id>.json 与 themes/<id>/theme.json 两种布局
   try {
     const safeId = id.replace(/[^A-Za-z0-9_-]/g, '_');
@@ -5612,8 +5777,9 @@ function loadThemePatches() {
   }
 }
 /** 主题附加样式：从 theme-patches.js 热加载，不硬编码在此 */
-function themeExtrasCss() {
-  return loadThemePatches().map((p) => (p && p.css ? p.css : '')).join('');
+function themeExtrasCss(id) {
+  return loadThemePatches().filter((p) => p && (!p.themeId || p.themeId === id) &&
+    (p.setting !== 'textShadow' || themeTextShadow.read())).map((p) => p.css || '').join('');
 }
 
 /** 主题变量别名层：从 theme-vars.js 热加载（官方漏定义/深色值不对的 token 重定向到主题变量）。
@@ -5639,7 +5805,7 @@ function loadThemeVars() {
   }
 }
 /** 生成变量别名 CSS：isDark 时 darkOnly 条目加 html[data-theme="dark"] 前缀；浅色主题跳过 darkOnly 条目 */
-function themeVarsCss(isDark) {
+function themeVarsCss(isDark, id) {
   const mod = loadThemeVars();
   const pre = isDark ? 'html[data-theme="dark"] ' : '';
   let out = '';
@@ -5651,6 +5817,7 @@ function themeVarsCss(isDark) {
     if (d) out += lead + 'body[data-vscode-theme-name]{' + d + '}';
   }
   for (const s of mod.scoped || []) {
+    if (s.themeId && s.themeId !== id) continue;
     if (s.darkOnly && !isDark) continue;
     const lead = (s.darkOnly ? pre : '') + 'body[data-vscode-theme-name] ';
     const sels = String(s.sel).split(',').map((seg) => lead + seg.trim()).join(',');
@@ -5689,7 +5856,7 @@ async function applyThemeByCdp(id) {
     }
     if (parts.length) localCssStr += 'body[data-vscode-theme-name] ' + loc.sel + '{' + parts.join('') + '}';
   }
-  const extrasCss = themeExtrasCss();
+  const extrasCss = themeExtrasCss(id);
   const isDark = !!(theme && theme.dark);
   // 背景图：主题 JSON 带 image 字段时，从 themes/<id>/<image> 读取转 data URL（WBSS 方案：#root 背景 + 容器透明化）
   let bgCssStr = '';
@@ -5767,7 +5934,8 @@ async function applyThemeByCdp(id) {
     var WBS_UID = ${JSON.stringify(uid || null)};
     // WorkDaddy 自定义主题已应用标记：theme-patches 里部分规则用 html[data-wbs-theme] 限定
     // 只在 WorkDaddy 内置自定义主题下生效（官方默认主题不激活）。
-    try { h.setAttribute('data-wbs-theme', ${id === 'default' ? "'0'" : "'1'"}); } catch (e) {}
+    try { h.setAttribute('data-wbs-theme', ${id === 'default' || id === 'dark' ? "'0'" : "'1'"}); } catch (e) {}
+    try { h.setAttribute('data-wbs-theme-id', ${JSON.stringify(id)}); } catch (e) {}
     // 联动 WorkBuddy 原生主题（源码 theme.ts ThemeManager + legacy-appearance-mode-storage）：
     // 1) 写 localStorage 'agent-ui-theme'（ThemeManager.saveTheme 同款结构），reload/重启后 WorkBuddy 自己恢复该主题；
     // 2) 写 'workbuddy.appearance.lastApplied'（getInitialTheme 优先读它，避免残留旧外观覆盖我们的配置）；
@@ -5809,12 +5977,12 @@ async function applyThemeByCdp(id) {
       h.setAttribute('data-theme', mode);
     }
     var s = document.getElementById('wbs-theme-style');
-    if (${id === 'default' ? 'true' : 'false'}) {
+    if (${id === 'default' || id === 'dark' ? 'true' : 'false'}) {
       if (s) s.remove();
-      // 默认主题：完全恢复官方浅色（移除 dark 标记，body 恢复官方浅色主题名）
-      h.removeAttribute('data-theme'); h.classList.remove('cb-dark');
-      b.setAttribute('data-vscode-theme-name', 'IDE Light'); b.classList.remove('vscode-dark');
-      wbsSyncNativeTheme('light');
+      // 原生浅色/深色只同步官方外观，不注入 WorkDaddy 色板和壁纸。
+      h.classList.toggle('cb-dark', ${isDark ? 'true' : 'false'});
+      b.classList.toggle('vscode-dark', ${isDark ? 'true' : 'false'});
+      wbsSyncNativeTheme(${JSON.stringify(isDark ? 'dark' : 'light')});
     } else {
       if (${isDark ? 'true' : 'false'}) {
         // 深色主题：切官方深色模式（局部硬编码变量随之变深）
@@ -5832,7 +6000,7 @@ async function applyThemeByCdp(id) {
       // 注入自定义色板（body 层覆盖，同优先级后插入胜出）+ 变量别名层（官方漏定义 token 重定向）
       var css = 'body[data-vscode-theme-name]{' + ${JSON.stringify(allCssStr)} + '}' +
         ${JSON.stringify(localCssStr)} +
-        ${JSON.stringify(themeVarsCss(isDark))} +
+        ${JSON.stringify(themeVarsCss(isDark, id))} +
         ${JSON.stringify(extrasCss)} + ${JSON.stringify(bgCssStr)};
       var st = s || document.createElement('style');
       st.id = 'wbs-theme-style';
@@ -6542,6 +6710,30 @@ async function fetchCredits(accessToken, account) {
   };
 }
 
+function rememberCreditRotation(uid, result) {
+  const key = String(uid || '').trim();
+  if (!key || !result || !Array.isArray(result.segments)) return;
+  creditRotationCache.set(key, {
+    uid: key,
+    credits: result.credits,
+    segments: result.segments,
+    unlimited: !!result.unlimited,
+    fetchedAt: Date.now(),
+  });
+}
+
+function cachedCreditRotationAccounts() {
+  const names = new Map(listAccounts(DATA_DIR).map((account) => [String(account.uid), account.nickname || '']));
+  return Array.from(creditRotationCache.values()).map((entry) => ({
+    uid: entry.uid,
+    nickname: names.get(entry.uid) || '',
+    creditSegments: entry.segments,
+    credits: entry.credits,
+    creditUnlimited: entry.unlimited,
+    creditFetchedAt: entry.fetchedAt,
+  }));
+}
+
 async function listDailyUsage(accounts, date = todayStr()) {
   const list = Array.isArray(accounts) ? accounts : [];
   if (!list.length) return {};
@@ -6605,6 +6797,17 @@ function decryptLegacyExport(b64, password) {
   const decipher = crypto.createDecipheriv('aes-256-gcm', exportSecretKey(password || EXPORT_PASSPHRASE, EXPORT_KDF_SALT), iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
+}
+
+function applyCheckinConsent(enabled) {
+  const pending = readCheckinConsent(DATA_DIR).shouldPrompt;
+  const choice = decideCheckinConsent(DATA_DIR, enabled);
+  if (!pending || !enabled || !choice.enabled) return choice;
+  const task = readAutomations(DATA_DIR).find((item) => item.id === 'daily-account-checkin' && item.enabled);
+  if (!task) return choice;
+  const running = Array.from(automationRuns.values()).find((run) => run.taskId === task.id && run.status === 'running');
+  const run = running || startAutomationRun(task);
+  return { ...choice, run: automationPublicRun(run) };
 }
 
 function handleApi(req, res) {
@@ -6724,6 +6927,21 @@ function handleApi(req, res) {
       if (!body || body.type !== 'panelOpened') return json(res, 400, { ok: false, error: '不支持的面板事件' });
       dispatchAutomationEvent('panelOpened', { source: 'panel' });
       return json(res, 200, { ok: true });
+    });
+  }
+
+  if (['GET', 'POST'].includes(req.method) && p === '/api/automations/checkin-consent') {
+    if (!PROFILE.capabilities.accounts || PROFILE.capabilities.checkin === false) {
+      return json(res, 200, { ok: true, shouldPrompt: false, enabled: false });
+    }
+    if (req.method === 'GET') {
+      try { return json(res, 200, readCheckinConsent(DATA_DIR)); }
+      catch (_) { return json(res, 500, { ok: false, error: 'Unable to read check-in choice' }); }
+    }
+    return readBody(req).then((body) => {
+      if (!body || typeof body.enabled !== 'boolean') return json(res, 400, { ok: false, error: 'Invalid check-in choice' });
+      try { return json(res, 200, applyCheckinConsent(body.enabled)); }
+      catch (_) { return json(res, 500, { ok: false, error: 'Unable to save check-in choice' }); }
     });
   }
 
@@ -7057,15 +7275,16 @@ function handleApi(req, res) {
   if (req.method === 'POST' && p === '/api/oauth/start') {
     return (async () => {
       try {
+        const oauthPlatform = PROFILE.id === 'workbuddy-ai' ? 'workbuddy-ai' : 'workbuddy';
         const resp = await httpJson(
-          `${WB_API_ENDPOINT}${WB_API_PREFIX}/auth/state?platform=workbuddy`,
+          `${WB_API_ENDPOINT}${WB_API_PREFIX}/auth/state?platform=${oauthPlatform}`,
           'POST',
           {}
         );
         const d = (resp && resp.data) || {};
         if (!d.state) throw new Error('auth/state 响应缺少 state');
         const authUrl =
-          d.authUrl || d.auth_url || d.url || `${WB_API_ENDPOINT}/login?state=${d.state}`;
+          d.authUrl || d.auth_url || d.url || `${WB_API_ENDPOINT}/login/started?platform=${oauthPlatform}&state=${encodeURIComponent(d.state)}`;
         const loginId = 'wd_' + crypto.randomUUID().replace(/-/g, '');
         oauthStates.set(loginId, {
           state: d.state,
@@ -7146,6 +7365,14 @@ function handleApi(req, res) {
     return json(res, 200, status);
   }
 
+  // The existing local API authorization gate requires the current profile token.
+  // Renderer sends no input, account, session or device payload to this route.
+  if (req.method === 'POST' && p === '/api/usage') {
+    req.resume();
+    usageReporter.report().catch(() => {});
+    return json(res, 200, { ok: true });
+  }
+
   if (req.method === 'GET' && p === '/api/telemetry-settings') {
     return json(res, 200, {
       ok: true,
@@ -7187,6 +7414,13 @@ function handleApi(req, res) {
     });
   }
 
+  if (req.method === 'POST' && p === '/api/accounts/order') {
+    return readBody(req).then((body) => {
+      try { return json(res, 200, { ok: true, accountOrder: setAccountOrder(DATA_DIR, body) }); }
+      catch (error) { return json(res, 400, { ok: false, error: error.message }); }
+    });
+  }
+
   if (req.method === 'GET' && p === '/api/accounts') {
     const accounts = listAccounts(DATA_DIR);
     const cache = loadCheckinCache();
@@ -7212,11 +7446,11 @@ function handleApi(req, res) {
             const withUsage = enriched.map((account) => summaries[account.uid]
               ? Object.assign({}, account, { todayUsage: summaries[account.uid] })
               : account);
-            return json(res, 200, { ok: true, current: currentAccount(), primaryUid: primaryAccountStore.get(), accounts: withUsage });
+            return json(res, 200, { ok: true, current: currentAccount(), primaryUid: primaryAccountStore.get(), accountOrder: getAccountOrder(DATA_DIR), accounts: withUsage });
           })
           .catch((error) => {
             log('[credits-usage] 读取本地今日用量失败: ' + error.message);
-            return json(res, 200, { ok: true, current: currentAccount(), primaryUid: primaryAccountStore.get(), accounts: enriched });
+            return json(res, 200, { ok: true, current: currentAccount(), primaryUid: primaryAccountStore.get(), accountOrder: getAccountOrder(DATA_DIR), accounts: enriched });
           });
       });
   }
@@ -7258,6 +7492,7 @@ function handleApi(req, res) {
           unlimited: !!r.unlimited,
           cycleResetTime: r.cycleResetTime || null,
         };
+        rememberCreditRotation(uid, r);
         if (usage.synced) payload.todayUsage = usage.value;
         return json(res, 200, payload);
       } catch (e) {
@@ -7267,6 +7502,102 @@ function handleApi(req, res) {
         return json(res, 500, { ok: false, error: e.message });
       }
     });
+  }
+
+  // 会话完成后的轮换建议：只刷新当前账号，其他账号只使用最近一次已缓存的积分段。
+  if (req.method === 'POST' && p === '/api/credit-rotation') {
+    return readBody(req).then(async (body) => {
+      const uid = String(body && body.uid || '').trim();
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(uid)) return json(res, 400, { ok: false, error: 'uid 格式无效' });
+      const current = currentAccount();
+      if (!current || String(current.uid) !== uid) return json(res, 409, { ok: false, error: '当前账号已发生变化' });
+      try {
+        const file = accountBackupFile(uid);
+        if (!fs.existsSync(file)) return json(res, 404, { ok: false, error: '账号备份不存在' });
+        const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const token = raw && raw.auth && (raw.auth.accessToken || raw.auth.access_token || raw.auth.token);
+        if (!token) return json(res, 400, { ok: false, error: '备份中无 accessToken' });
+        const previousCached = creditRotationCache.get(uid);
+        const refreshed = await fetchCredits(token, raw.account || {});
+        rememberCreditRotation(uid, refreshed);
+        const candidate = selectRotationCandidate(cachedCreditRotationAccounts(), uid, Date.now());
+        if (!candidate) return json(res, 200, { ok: true, shouldSuggest: false, current: { uid, segments: refreshed.segments } });
+        return json(res, 200, {
+          ok: true,
+          shouldSuggest: true,
+          current: { uid, segments: refreshed.segments },
+          candidate: {
+            uid: candidate.account.uid,
+            nickname: candidate.account.nickname || '',
+            remaining: candidate.segment.remaining,
+            expiresAt: candidate.segment.expiresAt,
+          },
+          generatedAt: Date.now(),
+        });
+      } catch (e) {
+        log(`[credit-rotation] 查询 ${uid} 失败: ${e.message}`);
+        if (e && e.expired) return json(res, 401, { ok: false, expired: true, error: '登录身份过期' });
+        return json(res, 500, { ok: false, error: e.message });
+      }
+    });
+  }
+
+  if (req.method === 'GET' && p === '/api/token-stats') {
+    if (PROFILE.kind !== 'workbuddy') return json(res, 400, { ok: false, error: '当前客户端不支持 Token 统计' });
+    if (url.searchParams.get('cacheStatus') === '1') return json(res, 200, { ok: true, cacheReady: tokenStatsCacheReady(PROFILE.dataRoot) });
+    const days = Math.max(1, Math.min(90, Number(url.searchParams.get('days') || 7)));
+    const accounts = listAccounts(DATA_DIR);
+    return sqliteQuery('SELECT id, user_id FROM sessions WHERE deleted_at IS NULL;')
+      .then((rows) => {
+        const sessionAccounts = Object.fromEntries(rows.map((row) => [String(row.id || ''), String(row.user_id || '')]).filter((item) => item[0] && item[1]));
+        const stats = scanTokenStatsCached(PROFILE.dataRoot, {
+          days,
+          account: url.searchParams.get('account') || '',
+          model: url.searchParams.get('model') || '',
+          accountOptions: accounts,
+          sessionAccounts,
+        });
+        return json(res, 200, { ok: true, stats, accounts: accounts.map((a) => ({ uid: a.uid, nickname: a.nickname || '', phone: a.phone || '' })) });
+      })
+      .catch((e) => {
+      log('[token-stats] 统计失败: ' + e.message);
+      const status = /日期范围|开始日期/.test(String(e && e.message)) ? 400 : 500;
+      return json(res, status, { ok: false, error: e.message || '读取会话统计失败' });
+      });
+  }
+
+  if (req.method === 'GET' && p === '/api/credit-stats') {
+    if (PROFILE.kind !== 'workbuddy') return json(res, 400, { ok: false, error: '当前客户端不支持积分历史查询' });
+    try {
+      const range = historyRange(url.searchParams.get('days') || 7);
+      const accounts = listAccounts(DATA_DIR);
+      const uid = url.searchParams.get('account') || '';
+      const selected = uid ? accounts.filter(a => a.uid === uid) : accounts;
+      if (uid && !selected.length) return json(res, 400, { ok: false, error: '账号选择无效' });
+      creditHistorySync.start({ accounts: selected, days: range.days });
+      return creditHistorySync.wait().then(result => json(res, 200, { ok: true, ...result,
+        accounts: accounts.map(a => ({ uid: a.uid, nickname: a.nickname || '' })) }));
+    } catch (error) { return json(res, error.status || 400, { ok: false, error: error.message }); }
+  }
+  if (req.method === 'GET' && p === '/api/credit-stats/sync') {
+    return json(res, 200, { ok: true, job: creditHistorySync.status() });
+  }
+  if (req.method === 'POST' && p === '/api/credit-stats') {
+    if (PROFILE.kind !== 'workbuddy') return json(res, 400, { ok: false, error: '当前客户端不支持积分历史查询' });
+    return readBody(req).then((body) => {
+      const range = historyRange(body && body.days !== undefined ? body.days : 7);
+      const requested = body && body.uids;
+      const accounts = listAccounts(DATA_DIR);
+      if (requested !== undefined && (!Array.isArray(requested) || requested.some(uid =>
+        typeof uid !== 'string' || !accounts.some(account => account.uid === uid)))) {
+        return json(res, 400, { ok: false, error: '账号选择无效' });
+      }
+      const selected = requested === undefined ? accounts : accounts.filter(account => requested.includes(account.uid));
+      if (!selected.length) return json(res, 400, { ok: false, error: '请先选择账号' });
+      return json(res, 202, { ok: true, job: creditHistorySync.start({ accounts: selected, days: range.days }),
+        accounts: accounts.map(a => ({ uid: a.uid, nickname: a.nickname || '' })) });
+    }).catch(error => json(res, error.status || 400, { ok: false,
+      error: error.status === 409 ? '另一个积分查询正在进行，请稍后重试' : '查询参数无效，请选择近 7、30 或 90 天' }));
   }
 
   // Read-only per-account continuous activity count; never creates a conversation or changes accounts.
@@ -7381,6 +7712,37 @@ function handleApi(req, res) {
         if (!text) throw new Error('未读取到有效内容，请选择导出文件');
         let envelope;
         try { envelope = JSON.parse(text); } catch (_) { throw new Error('文件不是有效的导出 JSON'); }
+        const plainJson = body && body.format === 'plain-json';
+        if (plainJson) {
+          const candidates = Array.isArray(envelope) ? envelope : (Array.isArray(envelope.accounts) ? envelope.accounts : [envelope]);
+          if (!candidates.length) throw new Error('JSON 中没有账号数据');
+          ensureDirs(DATA_DIR);
+          const imported = [];
+          for (const candidate of candidates) {
+            const j = candidate && typeof candidate === 'object' ? candidate : null;
+            const acct = j && j.account && typeof j.account === 'object' ? j.account : j;
+            const auth = j && j.auth && typeof j.auth === 'object' ? j.auth : null;
+            const uid = String(acct && acct.uid || '').trim();
+            const accessToken = String(auth && (auth.accessToken || auth.access_token || auth.token) || '').trim();
+            if (!/^[A-Za-z0-9_-]{1,128}$/.test(uid) || !accessToken) continue;
+            const normalized = {
+              account: { ...acct, uid },
+              auth: { ...auth, accessToken },
+            };
+            const authRecord = parseAuthJson(normalized);
+            if (!authRecord || authRecord.uid !== uid) continue;
+            const dest = backupPath(DATA_DIR, uid);
+            const tmp = dest + '.tmp';
+            fs.writeFileSync(tmp, JSON.stringify(normalized), { mode: 0o600 });
+            fs.renameSync(tmp, dest);
+            try { fs.chmodSync(dest, 0o600); } catch (_) {}
+            updateMeta(DATA_DIR, { uid, nickname: normalized.account.nickname || '', uin: normalized.account.uin || '', phone: normalized.account.phoneNumber || '' });
+            imported.push(uid);
+          }
+          if (!imported.length) throw new Error('没有找到符合格式的账号，请先让 WorkBuddy 整理 JSON');
+          log(`[import] 明文 JSON 导入 ${imported.length}/${candidates.length} 个账号`);
+          return json(res, 200, { ok: true, imported, count: imported.length });
+        }
         if (!envelope || envelope.wbsExport !== 'WorkDaddy') throw new Error('不是 WorkDaddy 的账号导出文件');
         const enteredPassword = body && typeof body.password === 'string' ? body.password : '';
         const password = enteredPassword.trim() ? enteredPassword : '';
@@ -7405,6 +7767,8 @@ function handleApi(req, res) {
           try { j = JSON.parse(info); } catch (_) { continue; }
           const acct = j.account || (Array.isArray(j.accounts) && j.accounts[0]);
           if (!acct || !acct.uid || String(acct.uid) !== uid) continue; // 安全校验：uid 必须匹配
+          const authRecord = parseAuthJson(j);
+          if (!authRecord || authRecord.uid !== uid) continue;
           const dest = backupPath(DATA_DIR, uid);
           const tmp = dest + '.tmp';
           fs.writeFileSync(tmp, info, { mode: 0o600 });
@@ -7559,6 +7923,27 @@ function handleApi(req, res) {
           .catch((e) => json(res, 500, { ok: false, error: '蒙版已保存但应用失败: ' + e.message }));
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
+      }
+    });
+  }
+
+  // 毛玻璃消息文字阴影：默认开启，关闭后随主题重应用移除样式。
+  if (req.method === 'GET' && p === '/api/theme-text-shadow') {
+    return json(res, 200, { ok: true, enabled: themeTextShadow.read() });
+  }
+  if (req.method === 'POST' && p === '/api/theme-text-shadow') {
+    return readBody(req).then(async (body) => {
+      let enabled;
+      try { enabled = themeTextShadow.save(body); }
+      catch (e) { return json(res, e.code ? 500 : 400, { ok: false, error: e.message }); }
+      try {
+        const currentFile = path.join(DATA_DIR, 'current-theme.json');
+        const cur = fs.existsSync(currentFile) ? JSON.parse(fs.readFileSync(currentFile, 'utf8')).id : 'default';
+        if (cur !== 'nebula') return json(res, 200, { ok: true, enabled, applied: false });
+        const info = await applyThemeByCdp(cur);
+        return json(res, 200, { ok: true, enabled, applied: info.ok });
+      } catch (e) {
+        return json(res, 500, { ok: false, error: '文字阴影已保存但应用失败: ' + e.message });
       }
     });
   }
@@ -7738,6 +8123,25 @@ function handleApi(req, res) {
       }
     });
   }
+  if (req.method === 'GET' && p === '/api/models/third-party') {
+    try { return json(res, 200, { ok: true, sources: thirdPartyModels.discover() }); }
+    catch (_) { return json(res, 400, { ok: false, error: '无法读取 CC Switch 本地配置位置' }); }
+  }
+  if (req.method === 'POST' && p === '/api/models/third-party/preview') {
+    return readBody(req).then(async (body) => {
+      if (!body || body.source !== 'cc-switch') return json(res, 400, { ok: false, error: '不支持的第三方来源' });
+      try { return json(res, 200, { ok: true, ...await thirdPartyModels.preview() }); }
+      catch (e) { return json(res, 400, { ok: false, error: e.message }); }
+    });
+  }
+  if (req.method === 'POST' && p === '/api/models/third-party/import') {
+    return readBody(req).then(async (body) => {
+      try {
+        const result = await thirdPartyModels.import(body);
+        return json(res, 200, { ok: true, confirmationRequired: result.confirmationRequired, duplicateIds: result.duplicateIds, imported: result.imported, replaced: result.replaced, sameIdSkipped: result.sameIdSkipped });
+      } catch (_) { return json(res, 400, { ok: false, error: '第三方模型导入失败，请重新读取列表并确认；原配置备份会保留在本地' }); }
+    });
+  }
   if (req.method === 'POST' && p === '/api/models/backup') {
     return readBody(req).then((body) => {
       try {
@@ -7859,23 +8263,49 @@ function handleApi(req, res) {
     const job = autoCopyJobs.get(url.searchParams.get('id') || '');
     return job ? json(res, 200, { ok: true, job: publicAutoCopyJob(job) }) : json(res, 404, { ok: false, error: '自动复制任务不存在' });
   }
-  // 加密导出会话及其受管消息附件：POST /api/sessions/export { ids, password }
+  // Stream the completed encrypted archive; clean up even if the download disconnects.
   if (req.method === 'POST' && p === '/api/sessions/export') {
     return readBody(req).then(async (body) => {
+      let result;
       try {
-        const result = await exportSessions(body && body.ids, body && body.password);
+        result = await exportSessions(body && body.ids, body && body.password);
+        if (res.destroyed) return;
+        const headers = {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': fs.statSync(result.file).size,
+          'Content-Disposition': 'attachment; filename="WorkDaddy-sessions.wds"',
+          'X-WorkDaddy-Count': String(result.count),
+          'Access-Control-Expose-Headers': 'X-WorkDaddy-Count',
+          'Cache-Control': 'no-store',
+        };
+        if (res.__wbsCorsOrigin) { headers['Access-Control-Allow-Origin'] = res.__wbsCorsOrigin; headers.Vary = 'Origin'; }
+        res.writeHead(200, headers);
+        await transferPipeline(fs.createReadStream(result.file), res);
         log(`[sessions-export] 已导出 ${result.count} 个会话`);
-        return json(res, 200, { ok: true, ...result });
       } catch (error) {
-        return json(res, 400, { ok: false, error: error.message });
+        if (!res.headersSent && !res.destroyed) json(res, 400, { ok: false, error: error.message });
+        else res.destroy();
+      } finally {
+        if (result) await fs.promises.rm(result.directory, { recursive: true, force: true });
       }
     });
   }
-  // 加密导入会话；targetUid 缺省时保留归档中的账号归属。
+  // Binary uploads carry a small length-prefixed JSON request followed by the
+  // archive. Legacy v2/v3 JSON imports keep their existing authenticated API.
   if (req.method === 'POST' && p === '/api/sessions/import') {
-    return readBody(req).then(async (body) => {
+    return (async () => {
+      let directory;
       try {
-        const result = await importSessions(body && body.content, body && body.password, body && body.targetUid);
+        let result;
+        if (String(req.headers['content-type'] || '').split(';')[0] === 'application/octet-stream') {
+          directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'workdaddy-session-import-'));
+          const body = await receiveSessionUpload(req, directory);
+          const payload = await readSessionTransfer(body.file, body.password, path.join(directory, 'staged'));
+          result = await importSessionArchives(payload, body.targetUid, true);
+        } else {
+          const body = await readBody(req);
+          result = await importSessions(body && body.content, body && body.password, body && body.targetUid);
+        }
         log(`[sessions-import] 已导入 ${result.imported.length} 个会话，失败 ${result.failed} 个`);
         return json(res, 200, {
           ok: true,
@@ -7886,8 +8316,10 @@ function handleApi(req, res) {
         });
       } catch (error) {
         return json(res, 400, { ok: false, error: error.message });
+      } finally {
+        if (directory) await fs.promises.rm(directory, { recursive: true, force: true });
       }
-    });
+    })();
   }
   // 复制会话：POST /api/sessions/copy { ids, targetUid }（保留原会话，复制记录+消息文件到目标账号）
   if (req.method === 'POST' && p === '/api/sessions/copy') {
@@ -8892,12 +9324,16 @@ log(`备份目录: ${DATA_DIR}`);
 updateDebug('daemon-start', { authFile: currentAuthFile(), dataDir: DATA_DIR, appPath: IS_WIN ? WORKDADDY_DIR_WIN : macWorkDaddyAppPath(), apiPort: UI_PORT_BASE });
 
 for (const preset of ['close-buddy-popups.json', ...(PROFILE.capabilities.accounts ? ['keep-accounts-active.json'] : [])]) {
-  try { installBuiltinTask(DATA_DIR, path.join(__dirname, 'builtin/automations', preset)); }
-  catch (_) { log('[automation] 初始化内置任务失败'); }
+  try {
+    const result = installBuiltinTask(DATA_DIR, path.join(__dirname, 'builtin/automations', preset));
+    if (result && result.status === 'upgraded') log(`[automation] 内置任务已升级: ${preset} (revision ${result.revision})`);
+  }
+  catch (_) { log('[automation] 初始化内置任务失败: ' + preset); }
 }
 if (PROFILE.capabilities.accounts && PROFILE.capabilities.checkin !== false) {
   try { installBuiltinTask(DATA_DIR, path.join(__dirname, 'builtin/automations/daily-account-checkin.json')); }
   catch (_) { log('[automation] 初始化签到任务失败'); }
+  initializeCheckinConsent(DATA_DIR);
 }
 restoreSleepMode();
 startServer();
