@@ -123,6 +123,44 @@ test('Windows staging build forces UTF-8 Python stdio', () => {
   assert.match(build, /export PYTHONIOENCODING=utf-8/);
 });
 
+test('Inno Setup CreateCustomForm calls pass all four required arguments', () => {
+  // Inno Setup registers (Projects/Src/Shared.ScriptFunc.pas):
+  //   function CreateCustomForm(const ClientWidth, ClientHeight: Integer;
+  //     const KeepSizeX, KeepSizeY: Boolean): TSetupForm;
+  // A zero-argument call is not caught until ISCC compiles the [Code] section,
+  // which is how upstream 1.2.2 shipped an uncompilable workdaddy.iss
+  // ("Invalid number of parameters" at release-build time).
+  const iss = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'win', 'workdaddy.iss'), 'utf8');
+  const name = 'CreateCustomForm';
+  const calls = [];
+  let i = 0;
+  while ((i = iss.indexOf(`${name}(`, i)) !== -1) {
+    let depth = 0;
+    let j = i + name.length;
+    for (; j < iss.length; j++) {
+      if (iss[j] === '(') depth++;
+      else if (iss[j] === ')') {
+        depth--;
+        if (depth === 0) break;
+      }
+    }
+    const args = iss.slice(i + name.length + 1, j);
+    let nested = 0;
+    let count = args.trim() ? 1 : 0;
+    for (const ch of args) {
+      if (ch === '(') nested++;
+      else if (ch === ')') nested--;
+      else if (ch === ',' && nested === 0) count++;
+    }
+    calls.push({ text: iss.slice(i, j + 1), count });
+    i = j + 1;
+  }
+  assert.ok(calls.length > 0, 'expected CreateCustomForm calls in workdaddy.iss');
+  for (const call of calls) {
+    assert.equal(call.count, 4, `${call.text} must pass 4 arguments, got ${call.count}`);
+  }
+});
+
 test('Windows installer excludes the repair prompt from all release stages', () => {
   const zipBuild = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-win-zip.sh'), 'utf8');
   const installerBuild = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-win-installer.ps1'), 'utf8');
