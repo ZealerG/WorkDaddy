@@ -103,6 +103,17 @@ test('every Windows batch file under scripts/ keeps CRLF line endings', () => {
   }
 });
 
+test('Windows CRLF gate inspects raw bytes instead of text-mode grep', () => {
+  // GNU grep on MS-Windows strips CR from files it decides are text before
+  // matching, so `grep -q $'\r'` never matches on the windows-latest runner:
+  // the gate then fails on the first .cmd in glob order whatever the file
+  // holds (it reported Install-WorkDaddy.cmd even though that blob carries 47
+  // CRLF pairs). Keep the byte-level check.
+  const workflow = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'build-win.yml'), 'utf8');
+  assert.doesNotMatch(workflow, /grep -q \$'\\r'/);
+  assert.match(workflow, /od -An -tx1/);
+});
+
 test('Windows installer excludes the repair prompt from all release stages', () => {
   const zipBuild = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-win-zip.sh'), 'utf8');
   const installerBuild = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-win-installer.ps1'), 'utf8');

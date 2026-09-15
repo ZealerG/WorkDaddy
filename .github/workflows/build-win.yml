@@ -42,10 +42,19 @@ jobs:
         shell: bash
         run: |
           for f in scripts/*.cmd; do
-            if ! grep -q $'\r' "$f"; then
-              echo "::error::$f 不是 CRLF，无法在 Windows 使用，请转换"
-              exit 1
-            fi
+            # 不要用 grep 去匹配 CR 字节：Windows 上的 GNU grep 会把它判定为
+            # 文本的文件的 CR 剥掉再匹配，那种写法在 windows-latest 上永远返回
+            # 非 0，循环会固定死在 glob 排序的第一个文件上误报（实测两次 CI 都报
+            # Install-WorkDaddy.cmd，而该文件在 git blob 与检出结果里都含 47 个
+            # CRLF）。这里直接看字节，不依赖 grep 的换行处理。
+            HEX="$(od -An -tx1 "$f" | tr -d ' \n')"
+            case "$HEX" in
+              *0d0a*) ;;
+              *)
+                echo "::error::$f 不是 CRLF，无法在 Windows 使用，请转换"
+                exit 1
+                ;;
+            esac
           done
           echo "所有 .cmd 均为 CRLF ✓"
 
