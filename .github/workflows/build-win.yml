@@ -1,9 +1,15 @@
 name: Build & Verify Windows Setup
 
 # 触发方式（任选其一都会跑这套打包+验证）：
-#   - 推 v* 标签（正式发版）
-#   - 手动触发（workflow_dispatch，可传版本号）
+#   - 推 v* 标签（正式发版，并自动创建 GitHub Release）
+#   - 手动触发（workflow_dispatch，可传版本号；只上传 artifact，不发 Release）
 #   - 推 master/main（可选，防回归）
+#
+# 版本号解析优先级：v* 标签名（去掉前导 v）> 手动输入 > 源码 DAEMON_VERSION。
+# 打标签发版必须用标签名作为构建版本：产物名是 WorkDaddy[-AI]-Setup-<ver>.exe，
+# 更新器要求资产名严格等于 WorkDaddy-Setup-<release tag>.exe，且包内 daemon/app 版本
+# 必须等于该版本，否则会以「安装包名称与目标 profile 或版本不一致」或
+# 「安装包内部 daemon 版本 X 与目标版本 Y 不一致」拒绝安装。
 on:
   push:
     tags:
@@ -47,9 +53,20 @@ jobs:
         id: ver
         shell: bash
         run: |
-          VER="${{ github.event.inputs.version }}"
+          set -euo pipefail
+          VER=""
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VER="${GITHUB_REF_NAME#v}"
+          fi
           if [ -z "$VER" ]; then
-            VER=$(grep -o "DAEMON_VERSION = '[^']*'" scripts/daemon.js | head -1 | cut -d"'" -f2)
+            VER="${{ github.event.inputs.version }}"
+          fi
+          if [ -z "$VER" ]; then
+            VER=$(grep -o "const DAEMON_VERSION = '[^']*'" scripts/daemon.js | head -1 | cut -d"'" -f2)
+          fi
+          if ! [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::版本号必须是 x.y.z（当前解析为 '$VER'）"
+            exit 1
           fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "检测到版本: $VER"
@@ -104,6 +121,19 @@ jobs:
             throw 'Windows 发布目录仍包含旧 ZIP 产物。'
           }
 
+      - name: 校验产物名与发版版本一致
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          for f in "release/windows/WorkDaddy-Setup-$V.exe" "release/windows/WorkDaddy-AI-Setup-$V.exe"; do
+            if [ ! -s "$f" ]; then
+              echo "::error::缺少 $f（产物名必须等于 WorkDaddy[-AI]-Setup-<version>.exe，否则更新器会拒绝安装）"
+              exit 1
+            fi
+            echo "OK: $f"
+          done
+
       - name: 列出产物
         shell: bash
         run: ls -lh release/windows/
@@ -129,5 +159,4 @@ jobs:
           files: |
             release/windows/WorkDaddy-Setup-*.exe
             release/windows/WorkDaddy-AI-Setup-*.exe
-            release/*.dmg
           generate_release_notes: true
