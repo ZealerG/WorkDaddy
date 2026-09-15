@@ -22,6 +22,13 @@ if [ -z "$PYTHON_BIN" ]; then
   exit 2
 fi
 
+# 本脚本的内联 Python 片段会向 stdout 打印中文（例如品牌化完成提示）。Windows 上
+# Python 3.x 默认按系统 ANSI 代码页（cp1252）编码 stdout，于是抛
+# UnicodeEncodeError: 'charmap' codec can't encode characters。这里强制 stdio 走
+# UTF-8；显式赋值同时覆盖外部环境传入的 PYTHONIOENCODING。只影响 stdio，不改动
+# 各片段里已经显式指定 encoding 或二进制模式的文件读写。
+export PYTHONIOENCODING=utf-8
+
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
 mkdir -p release/windows

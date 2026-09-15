@@ -114,6 +114,15 @@ test('Windows CRLF gate inspects raw bytes instead of text-mode grep', () => {
   assert.match(workflow, /od -An -tx1/);
 });
 
+test('Windows staging build forces UTF-8 Python stdio', () => {
+  // Windows Python 3.x encodes stdout with the system ANSI code page (cp1252),
+  // so the inlined AI-branding snippet's Chinese print dies with
+  // UnicodeEncodeError: 'charmap' codec can't encode characters in position 5-12.
+  // The script must force UTF-8 stdio itself rather than rely on the caller.
+  const build = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-win-zip.sh'), 'utf8');
+  assert.match(build, /export PYTHONIOENCODING=utf-8/);
+});
+
 test('Windows installer excludes the repair prompt from all release stages', () => {
   const zipBuild = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-win-zip.sh'), 'utf8');
   const installerBuild = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-win-installer.ps1'), 'utf8');
